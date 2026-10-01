@@ -1,12 +1,12 @@
 import asyncio
-import shutil
+import time
 
 import pytest
 
-from qwen_reader.player import MpvPlayer
+from qwen_reader.player import MpvPlayer, find_mpv
 
 
-@pytest.mark.skipif(not shutil.which("mpv"), reason="mpv is not installed")
+@pytest.mark.skipif(not find_mpv(), reason="mpv is not installed")
 async def test_load_paused_restores_without_playing_from_the_beginning(tmp_path, wav_bytes):
     path = tmp_path / "resume.wav"
     path.write_bytes(wav_bytes(5))
@@ -30,7 +30,7 @@ async def test_load_paused_restores_without_playing_from_the_beginning(tmp_path,
         await player.close()
 
 
-@pytest.mark.skipif(not shutil.which("mpv"), reason="mpv is not installed")
+@pytest.mark.skipif(not find_mpv(), reason="mpv is not installed")
 async def test_real_mpv_play_pause_seek_speed_and_cleanup(tmp_path, wav_bytes):
     path = tmp_path / "audio.wav"
     path.write_bytes(wav_bytes(20))
@@ -38,7 +38,7 @@ async def test_real_mpv_play_pause_seek_speed_and_cleanup(tmp_path, wav_bytes):
     try:
         await player.start()
         process = player.process
-        socket_dir = player.directory.name
+        socket_dir = player.directory.name if player.directory else None
         await player.load(path, 1.0)
         await asyncio.sleep(0.15)
         position, paused, ended = await player.status()
@@ -74,10 +74,10 @@ async def test_real_mpv_play_pause_seek_speed_and_cleanup(tmp_path, wav_bytes):
     from pathlib import Path
 
     assert process.returncode is not None
-    assert not Path(socket_dir).exists()
+    assert socket_dir is None or not Path(socket_dir).exists()
 
 
-@pytest.mark.skipif(not shutil.which("mpv"), reason="mpv is not installed")
+@pytest.mark.skipif(not find_mpv(), reason="mpv is not installed")
 async def test_streaming_queue_global_seek_pause_and_resume_from_live_edge(tmp_path, wav_bytes):
     paths = [tmp_path / f"part-{i}.wav" for i in range(3)]
     for path in paths:
@@ -113,5 +113,32 @@ async def test_streaming_queue_global_seek_pause_and_resume_from_live_edge(tmp_p
         assert (await player.status())[0] >= 2
         await player.seek(0)
         assert (await player.status())[2] is False
+    finally:
+        await player.close()
+
+
+@pytest.mark.skipif(not find_mpv(), reason="mpv is not installed")
+async def test_position_is_continuous_across_gapless_part_transitions(tmp_path, wav_bytes):
+    paths = [tmp_path / f"part-{i}.wav" for i in range(6)]
+    for path in paths:
+        path.write_bytes(wav_bytes(0.5))
+    player = MpvPlayer(audio_output="null")
+    try:
+        await player.start()
+        await player.load(paths[0], 1)
+        started = time.monotonic()
+        for path in paths[1:]:
+            await player.append(path, 0.5)
+        drift = []
+        previous = 0.0
+        # Polling every few milliseconds lands inside mpv's brief file-switch windows.
+        while (elapsed := time.monotonic() - started) < 2.2:
+            position, _, ended = await player.status()
+            assert position >= previous - 0.02
+            previous = position
+            drift.append(position - elapsed)
+            await asyncio.sleep(0.003)
+        assert not ended
+        assert max(drift) - min(drift) < 0.15
     finally:
         await player.close()

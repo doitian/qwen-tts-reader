@@ -6,7 +6,9 @@ import binascii
 import contextlib
 import hashlib
 import json
+import logging
 import tempfile
+import time
 import uuid
 import wave
 from collections.abc import AsyncIterator, Callable
@@ -22,6 +24,8 @@ from .narration import Cue, narration_spans
 
 SAMPLE_RATE = 24000
 BYTES_PER_SECOND = SAMPLE_RATE * 2  # signed 16-bit mono PCM
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -238,7 +242,10 @@ class Synthesizer:
                 if on_cue:
                     on_cue(cue)
                 while True:
+                    waiting = time.monotonic()
                     part = await queues[index].get()
+                    if (waited := time.monotonic() - waiting) > 0.05:
+                        log.info("waited %.2fs for audio from paragraph %d", waited, index)
                     if part is None:
                         break
                     if isinstance(part, Exception):
@@ -269,8 +276,11 @@ class Synthesizer:
     ) -> AsyncIterator[AudioPart]:
         path = self.cache_path(text, "chunk")
         if valid_wav(path):
+            log.debug("paragraph %d: cached chunk %s", index, path.name)
             yield AudioPart(path, wav_duration(path))
             return
+        requested = time.monotonic()
+        log.debug("paragraph %d: requesting %d characters", index, len(text))
         with tempfile.NamedTemporaryFile(
             dir=self.settings.cache_dir, suffix=".partial", delete=False
         ) as temp:
@@ -286,6 +296,12 @@ class Synthesizer:
                 pcm_stream = self.stream_pcm(text)
                 async with contextlib.aclosing(pcm_stream):
                     async for pcm in pcm_stream:
+                        if not total:
+                            log.debug(
+                                "paragraph %d: first audio after %.2fs",
+                                index,
+                                time.monotonic() - requested,
+                            )
                         total += len(pcm)
                         if total > 100 * 1024 * 1024:
                             raise ValueError("TTS audio chunk exceeds the 100 MB limit.")
@@ -303,6 +319,14 @@ class Synthesizer:
                     raise ValueError("TTS returned empty or incomplete PCM audio frames.")
             wav_duration(temporary)
             temporary.replace(path)
+            elapsed = time.monotonic() - requested
+            log.info(
+                "paragraph %d: %.2fs of audio in %.2fs (%.1fx real time)",
+                index,
+                total / BYTES_PER_SECOND,
+                elapsed,
+                total / BYTES_PER_SECOND / elapsed,
+            )
             if pending:
                 segment = spool_dir / f"paragraph-{index:06}-{part_number:06}.wav"
                 write_pcm_wav(segment, bytes(pending))

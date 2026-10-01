@@ -3,23 +3,47 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import shutil
+import sys
 import tempfile
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 from .synthesis import wav_duration
+
+log = logging.getLogger(__name__)
 
 
 class PlayerError(RuntimeError):
     pass
 
 
-class MpvPlayer:
-    """A private mpv process controlled over its JSON IPC Unix socket."""
+def find_mpv() -> str | None:
+    if sys.platform == "win32":
+        # mpv.com, which PATHEXT finds first, is a console wrapper; terminating it orphans mpv.exe.
+        return shutil.which("mpv.exe")
+    return shutil.which("mpv")
 
-    def __init__(self, *, audio_output: str | None = None):
+
+async def open_ipc_connection(address: str) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    if sys.platform != "win32":
+        return await asyncio.open_unix_connection(address)
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader(loop=loop)
+    protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
+    transport, _ = await loop.create_pipe_connection(lambda: protocol, address)
+    return reader, asyncio.StreamWriter(transport, protocol, reader, loop)
+
+
+class MpvPlayer:
+    """A private mpv process controlled over JSON IPC: a Unix socket, or a Windows named pipe."""
+
+    def __init__(self, *, audio_output: str | None = None, log_file: Path | None = None):
         self.audio_output = audio_output
+        self.log_file = log_file
         self.process: asyncio.subprocess.Process | None = None
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
@@ -33,14 +57,20 @@ class MpvPlayer:
     async def start(self) -> None:
         if self.process is not None and self.process.returncode is None:
             return
-        if not shutil.which("mpv"):
+        executable = find_mpv()
+        if not executable:
             raise PlayerError(
-                "mpv is required. Install it with brew install mpv or your package manager."
+                "mpv is required. Install it with brew install mpv, scoop install mpv, "
+                "or your package manager."
             )
-        self.directory = tempfile.TemporaryDirectory(prefix="qwen-mpv-", dir="/tmp")
-        socket = Path(self.directory.name) / "ipc.sock"
+        if sys.platform == "win32":
+            address = rf"\\.\pipe\qwen-mpv-{uuid.uuid4().hex}"
+        else:
+            # Short base directory: Unix socket paths are limited to about 104 bytes.
+            self.directory = tempfile.TemporaryDirectory(prefix="qwen-mpv-", dir="/tmp")
+            address = str(Path(self.directory.name) / "ipc.sock")
         args = [
-            "mpv",
+            executable,
             "--no-config",
             "--idle=yes",
             "--no-video",
@@ -49,10 +79,13 @@ class MpvPlayer:
             "--gapless-audio=yes",
             "--audio-pitch-correction=yes",
             "--input-default-bindings=no",
-            f"--input-ipc-server={socket}",
+            f"--input-ipc-server={address}",
         ]
         if self.audio_output:
             args.append(f"--ao={self.audio_output}")
+        if self.log_file:
+            args.append(f"--log-file={self.log_file}")
+        log.info("starting %s with IPC %s", executable, address)
         try:
             self.process = await asyncio.create_subprocess_exec(
                 *args,
@@ -65,7 +98,7 @@ class MpvPlayer:
                     if self.process.returncode is not None:
                         raise PlayerError("mpv exited during startup. Check your mpv installation.")
                     try:
-                        self.reader, self.writer = await asyncio.open_unix_connection(str(socket))
+                        self.reader, self.writer = await open_ipc_connection(address)
                         break
                     except (FileNotFoundError, ConnectionRefusedError):
                         await asyncio.sleep(0.05)
@@ -79,6 +112,7 @@ class MpvPlayer:
                 raise PlayerError("The audio player is not running.")
             self.request_id += 1
             request_id = self.request_id
+            started = time.monotonic()
             try:
                 async with asyncio.timeout(3):
                     self.writer.write(
@@ -87,8 +121,13 @@ class MpvPlayer:
                     await self.writer.drain()
                     while line := await self.reader.readline():
                         response = json.loads(line)
+                        if "event" in response:
+                            log.debug("mpv event %s", line.decode().strip())
                         if response.get("request_id") != request_id:
                             continue
+                        elapsed = time.monotonic() - started
+                        if elapsed > 0.1:
+                            log.warning("slow mpv command %s took %.3fs", command, elapsed)
                         if response.get("error") != "success":
                             raise PlayerError(f"mpv: {response.get('error', 'unknown error')}")
                         return response.get("data")
@@ -132,7 +171,15 @@ class MpvPlayer:
             was_last = index == len(self.parts) - 1
             await self.command("loadfile", str(path.resolve()), "append")
             self.parts.append((path.resolve(), duration))
+            log.debug(
+                "appended %s (%.2fs) as part %d while playing part %d",
+                path.name,
+                duration,
+                len(self.parts) - 1,
+                index,
+            )
             if ended and was_last:
+                log.warning("playback had run out of audio; restarting at part %d", index + 1)
                 await self.command("playlist-play-index", index + 1)
                 await self.wait_loaded(path)
                 await self.command("set_property", "pause", self.user_paused)
@@ -147,11 +194,14 @@ class MpvPlayer:
     async def status(self) -> tuple[float, bool, bool]:
         async with self.playback_lock:
             # A native playlist transition may occur between IPC replies; retry its snapshot.
-            for _ in range(3):
+            # mpv has no position for a few milliseconds while it switches files.
+            for attempt in range(20):
+                if attempt:
+                    await asyncio.sleep(0.01)
                 index = await self.command("get_property", "playlist-pos")
                 try:
-                    position = await self.command("get_property", "time-pos")
                     ended = await self.command("get_property", "eof-reached")
+                    position = await self.part_position(ended)
                 except PlayerError as exc:
                     if "property unavailable" not in str(exc):
                         raise
@@ -159,11 +209,17 @@ class MpvPlayer:
                 if index == await self.command("get_property", "playlist-pos"):
                     offset = sum(duration for _, duration in self.parts[: max(0, index)])
                     return (
-                        offset + float(position or 0),
+                        max(0.0, offset + float(position or 0)),
                         self.user_paused,
                         bool(ended and index == len(self.parts) - 1),
                     )
             raise PlayerError("mpv could not read the playback position.")
+
+    async def part_position(self, ended: bool) -> float | None:
+        # After a gapless switch, time-pos reads 0 in the next part while the previous part's
+        # last ~0.25s is still audible; audio-pts stays negative until that audio has played.
+        # audio-pts is unavailable at EOF, and briefly during the switch itself.
+        return await self.command("get_property", "time-pos" if ended else "audio-pts")
 
     async def set_paused(self, paused: bool) -> None:
         async with self.playback_lock:

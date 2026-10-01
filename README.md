@@ -4,7 +4,7 @@ A Python / Textual TUI that extracts articles through [Defuddle](https://defuddl
 
 ## Run
 
-Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and **mpv** on Linux or macOS. Install mpv with your system package manager (`brew install mpv`, `sudo apt install mpv`, or `sudo pacman -S mpv`).
+Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and **mpv** on Linux, macOS, or Windows. Install mpv with your system package manager (`brew install mpv`, `sudo apt install mpv`, `sudo pacman -S mpv`, or `scoop install mpv`). On Windows, `mpv` must be on your `PATH`, and you should use `copy .env.example .env` instead of `cp`.
 
 ```sh
 uv sync
@@ -80,6 +80,9 @@ Applying a different model or voice stops playback; press Read to use the select
 | `QWEN_TTS_VOICE` | Optional override; leave blank for the selected model's default |
 | `DEFUDDLE_API_KEY` | Optional key for additional Defuddle requests |
 | `QWEN_READER_CACHE_DIR` | `$XDG_CACHE_HOME/qwen-tts-reader`, otherwise `~/.cache/qwen-tts-reader` |
+| `QWEN_READER_LOG` | Optional playback timing log path; same as `--log` |
+
+To debug choppy playback, run `uv run qwen-reader --log reader.log URL`. `reader.log` records TTS speed per paragraph, audio buffered ahead of playback, waits for audio, and stalls; mpv's own log goes to `reader.mpv.log`. Logs contain file names and timings, not API keys or article text.
 
 `--voice VOICE` overrides `QWEN_TTS_VOICE`. `--model` selects that model's default voice unless `--voice` is also supplied. Voice IDs differ by model; see the [official voice list](https://help.aliyun.com/zh/model-studio/qwen-audio-tts-voice-list).
 

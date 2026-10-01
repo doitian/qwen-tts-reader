@@ -69,6 +69,8 @@ def test_empty_article_is_reported():
         "A short article.",
         "第一段\n\nSecond paragraph, with words!\n\n" * 300,
     ],
+    # Windows caps environment variables, including PYTEST_CURRENT_TEST, at 32767 characters.
+    ids=["english", "chinese", "unbroken", "short", "paragraphs"],
 )
 def test_chunks_preserve_all_nonwhitespace_and_respect_limit(text):
     chunks = split_text(text, 100)

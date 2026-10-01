@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 from dataclasses import asdict, replace
 
 import httpx
@@ -28,7 +29,8 @@ def test_progress_roundtrip_multiple_articles_and_private_atomic_file(tmp_path):
     assert restored.get(two.url, two.narration) == two
     assert restored.get(one.url, "changed-model-or-text") is None
     assert restored.last_url == two.url
-    assert path.stat().st_mode & 0o777 == 0o600
+    if sys.platform != "win32":
+        assert path.stat().st_mode & 0o777 == 0o600
     assert list(tmp_path.iterdir()) == [path]
 
 

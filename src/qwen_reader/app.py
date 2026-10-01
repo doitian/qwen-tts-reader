@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import tempfile
 import time
 from dataclasses import replace
@@ -26,6 +27,8 @@ from .playback_state import Bookmark, PlaybackState
 from .player import MpvPlayer, PlayerError
 from .screens import ReaderCommandPalette
 from .synthesis import Synthesizer
+
+log = logging.getLogger(__name__)
 
 
 def timestamp(seconds: float) -> str:
@@ -126,6 +129,8 @@ class ReaderApp(App):
         self.last_saved_at = 0.0
         self.save_warning_shown = False
         self.closing = False
+        self.buffering_since: float | None = None
+        self.playing_sample: tuple[float, float] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -225,7 +230,10 @@ class ReaderApp(App):
         try:
             await self.player.stop()
             self.cleanup_spool()
-            self.spool = tempfile.TemporaryDirectory(prefix="qwen-stream-")
+            # On Windows, files mpv still holds open cannot be deleted.
+            self.spool = tempfile.TemporaryDirectory(
+                prefix="qwen-stream-", ignore_cleanup_errors=True
+            )
             article = await fetch_article(self.client, url, self.settings.defuddle_key)
             self.query_one("#article-title", Static).update(article.title)
             self.query_one("#article-meta", Static).update(
@@ -270,6 +278,13 @@ class ReaderApp(App):
                     else:
                         await self.player.append(part.path, part.duration)
                     self.duration += part.duration
+                    log.debug(
+                        "received %s (%.2fs); %.2fs buffered ahead of %.2fs",
+                        part.path.name,
+                        part.duration,
+                        self.duration - self.position,
+                        self.position,
+                    )
                     await self.restore_position()
                     await self.apply_pending_seek()
                     await self.checkpoint()
@@ -342,6 +357,7 @@ class ReaderApp(App):
             return
         if not self.ready or not self.is_running or self.closing:
             return
+        self.log_playback(position, paused, ended)
         self.position, self.paused = position, paused
         self.ended = self.restored_finished or (ended and not self.preparing)
         position = self.duration if self.ended else min(self.position, self.duration)
@@ -362,6 +378,33 @@ class ReaderApp(App):
         self.update_reading()
         self.update_playback_status(buffering=ended and self.preparing)
         await self.checkpoint()
+
+    def log_playback(self, position: float, paused: bool, ended: bool) -> None:
+        now = time.monotonic()
+        buffering = ended and self.preparing
+        if buffering and self.buffering_since is None:
+            self.buffering_since = now
+            log.warning("ran out of audio at %.2fs; %.2fs received", position, self.duration)
+        elif not buffering and self.buffering_since is not None:
+            log.info("audio resumed after %.2fs of buffering", now - self.buffering_since)
+            self.buffering_since = None
+        if paused or ended:
+            self.playing_sample = None
+            return
+        if self.playing_sample:
+            then, previous = self.playing_sample
+            elapsed, advanced = now - then, position - previous
+            if elapsed > 0.5:
+                log.warning("playback poll delayed: %.2fs since the previous poll", elapsed)
+            # Seeks move the position backwards or too far forwards; only a shortfall is a stall.
+            if 0 <= advanced < elapsed * self.speed - 0.25:
+                log.warning(
+                    "playback stalled near %.2fs: advanced %.2fs in %.2fs",
+                    position,
+                    advanced,
+                    elapsed,
+                )
+        self.playing_sample = (now, position)
 
     async def checkpoint(self, *, force: bool = False, query_player: bool = False) -> None:
         if not self.playback_loaded or self.restoring or not self.current_url:
