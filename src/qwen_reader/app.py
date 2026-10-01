@@ -166,6 +166,10 @@ class ReaderApp(App):
         self.pending_offset = 0.0
         self.unpause_after_seek = False
         self.restore_target: tuple[int, float] = (0, 0.0)
+        self.held_position: float | None = None
+        self.restarting = False
+        self.restart_paused = False
+        self.held_until: float | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -321,7 +325,7 @@ class ReaderApp(App):
 
     @work(exclusive=True, group="prepare")
     async def restart_window(
-        self, unit: int, offset: float, paused: bool, previous: Worker | None = None
+        self, unit: int, offset: float, previous: Worker | None = None
     ) -> None:
         if previous:
             with contextlib.suppress(WorkerCancelled, WorkerFailed):
@@ -329,7 +333,7 @@ class ReaderApp(App):
         self.restoring = None
         self.pending_selection, self.pending_offset = unit, offset
         try:
-            await self.stream_window(unit, paused=paused)
+            await self.stream_window(unit, paused=None)
         except asyncio.CancelledError:
             raise
         except (httpx.HTTPError, ValueError, OSError, PlayerError, TimeoutError) as exc:
@@ -341,11 +345,20 @@ class ReaderApp(App):
         """Replace the playlist with one from which `unit` (plus `offset`) can play."""
         log.info("restarting playback at unit %d + %.2fs", unit, offset)
         self.position = self.timeline.start(unit) + offset
-        self.prepare_worker = self.restart_window(
-            unit, offset, self.paused if paused is None else paused, self.prepare_worker
-        )
+        self.hold_position(self.position, None)
+        self.restart_paused = self.intended_paused() if paused is None else paused
+        self.restarting = True
+        self.prepare_worker = self.restart_window(unit, offset, self.prepare_worker)
 
-    async def stream_window(self, unit: int, *, paused: bool = False) -> None:
+    def intended_paused(self) -> bool:
+        """The pause state to keep, ignoring the silence while a restore or seek is pending."""
+        if self.restarting:
+            return self.restart_paused
+        if self.restoring is not None:
+            return self.restoring.paused or self.restoring.completed
+        return self.paused and not self.unpause_after_seek
+
+    async def stream_window(self, unit: int, *, paused: bool | None = False) -> None:
         """Play from the cached run just before `unit`, then stream on while there is room.
 
         Earlier paragraphs are never generated, but cached ones join the playlist,
@@ -386,10 +399,13 @@ class ReaderApp(App):
                 if not self.ready:
                     # Stay silent until a restore or a seek reaches its target.
                     waiting = self.restoring is not None or self.pending_selection is not None
-                    await self.player.load(part.path, self.speed, paused=paused or waiting)
+                    # None: a restart, whose pause state play/pause may change while it waits.
+                    requested = self.restart_paused if paused is None else paused
+                    intended = requested if self.restoring is None else self.intended_paused()
+                    await self.player.load(part.path, self.speed, paused=intended or waiting)
                     await self.player.set_speed(self.speed)
-                    self.paused = paused or waiting
-                    self.unpause_after_seek = waiting and not paused and self.restoring is None
+                    self.paused = intended or waiting
+                    self.unpause_after_seek = waiting and not intended
                     self.ended = False
                     self.playback_loaded = True
                     self.set_ready(True)
@@ -427,8 +443,11 @@ class ReaderApp(App):
         return str(exc) or "Audio preparation timed out. Try again."
 
     def finish_preparing(self) -> None:
+        self.restarting = False
         self.preparing = False
         self.pending_selection = None
+        if self.held_until is None:
+            self.held_position = None
         if self.is_running:
             self.update_reading()
             if not self.ready:
@@ -524,6 +543,12 @@ class ReaderApp(App):
         self.log_playback(position, paused, ended)
         if self.seek_target is not None:
             position, ended = self.seek_target, False
+        elif self.held_position is not None:
+            reached = abs(position - self.held_position) < 0.3
+            if reached or (self.held_until is not None and time.monotonic() > self.held_until):
+                self.held_position = None
+            else:
+                position, ended = self.held_position, False
         self.position, self.paused = position, paused
         self.ended = self.restored_finished or (ended and not self.preparing)
         position = self.duration if self.ended else self.position
@@ -551,6 +576,20 @@ class ReaderApp(App):
 
     async def player_seek(self, position: float) -> None:
         await self.player.seek(max(0.0, position - self.timeline.anchor_time))
+        self.hold_position(position)
+        self.restarting = False
+        if self.unpause_after_seek:
+            self.unpause_after_seek = False
+            await self.player.set_paused(False)
+
+    def hold_position(self, position: float, seconds: float | None = 1.0) -> None:
+        """Show `position` until mpv reports it, so the highlight never flicks back.
+
+        Right after a seek mpv may still report the old position; during a restart
+        it plays from earlier cached audio until the target is reached.
+        """
+        self.held_position = position
+        self.held_until = None if seconds is None else time.monotonic() + seconds
 
     async def seek_to(self, target: float) -> None:
         """Seek within the playlist, or restart it where `target` falls."""
@@ -640,6 +679,7 @@ class ReaderApp(App):
         target = max(self.timeline.anchor_time, min(target, self.duration - 0.01))
         await self.player_seek(target)
         await self.player.set_paused(bookmark.paused or bookmark.completed)
+        self.unpause_after_seek = False
         self.restoring = None
         self.restored_finished = bookmark.completed
         self.position, self.paused = target, bookmark.paused or bookmark.completed
@@ -650,6 +690,7 @@ class ReaderApp(App):
 
     def reset_reading(self) -> None:
         self.cancel_queued_seek()
+        self.held_position = None
         self.cues.clear()
         self.pending_selection = None
         self.query_one(ArticleText).highlight(None)
@@ -714,6 +755,8 @@ class ReaderApp(App):
 
     async def action_paragraph(self, delta: int) -> None:
         text = self.query_one(ArticleText)
+        if not text.spans:
+            return
         # Repeated presses move a queued selection that is still waiting for audio.
         base = self.pending_selection if self.pending_selection is not None else text.current
         if base is None:
@@ -762,6 +805,8 @@ class ReaderApp(App):
         if not 0 <= index < len(text.spans):
             return False
         self.cancel_queued_seek()
+        if paused is None:
+            paused = self.intended_paused()
         self.restoring = None
         self.pending_selection, self.pending_offset = index, 0.0
         seeked = await self.apply_pending_seek()
@@ -789,9 +834,6 @@ class ReaderApp(App):
         try:
             self.restored_finished = False
             await self.player_seek(target)
-            if self.unpause_after_seek:
-                self.unpause_after_seek = False
-                await self.player.set_paused(False)
             self.position = target
             self.ended = False
             await self.refresh_playback()
@@ -804,6 +846,12 @@ class ReaderApp(App):
     @on(Button.Pressed, "#play")
     async def action_toggle_pause(self) -> None:
         await self.flush_seek()
+        if self.restarting:
+            # Stay silent until the restart reaches its target; change what happens then.
+            self.restart_paused = not self.restart_paused
+            self.unpause_after_seek = not self.restart_paused
+            self.update_playback_status()
+            return
         if not self.ready:
             return
         try:
@@ -832,6 +880,8 @@ class ReaderApp(App):
         # Repeated presses build on the queued target, not mpv's not-yet-seeked position.
         if self.seek_target is not None:
             position = self.seek_target
+        elif self.held_position is not None:
+            position = self.held_position
         else:
             try:
                 position, _, ended = await self.player_status()
@@ -974,25 +1024,41 @@ class ReaderApp(App):
         if self.closing:
             return
         self.closing = True
-        if self.prepare_worker:
-            self.prepare_worker.cancel()
-            with contextlib.suppress(WorkerCancelled, WorkerFailed):
-                await self.prepare_worker.wait()
+        log.info("quit requested")
+        await self.stop_preparing()
         await self.checkpoint(force=True, query_player=True)
         self.playback_loaded = False
+        log.info("quit: progress saved, exiting")
         self.exit()
 
     async def on_unmount(self) -> None:
         self.closing = True
-        if self.prepare_worker:
-            self.prepare_worker.cancel()
-            with contextlib.suppress(WorkerCancelled, WorkerFailed):
-                await self.prepare_worker.wait()
+        await self.stop_preparing()
         await self.checkpoint(force=True, query_player=True)
         self.playback_loaded = False
-        await self.player.close()
+        started = time.monotonic()
+        # Never let a stuck player keep the reader open.
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(5):
+                await self.player.close()
+        log.info("unmount: player closed in %.2fs", time.monotonic() - started)
         self.cleanup_spool()
         await self.client.aclose()
+        log.info("unmount: done")
+
+    async def stop_preparing(self) -> None:
+        if not self.prepare_worker:
+            return
+        started = time.monotonic()
+        self.prepare_worker.cancel()
+        with contextlib.suppress(WorkerCancelled, WorkerFailed, TimeoutError):
+            async with asyncio.timeout(2):
+                await self.prepare_worker.wait()
+        log.info(
+            "stopped streaming in %.2fs (worker %s)",
+            time.monotonic() - started,
+            self.prepare_worker.state.name,
+        )
 
     def cleanup_spool(self) -> None:
         if self.spool:

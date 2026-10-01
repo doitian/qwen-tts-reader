@@ -350,3 +350,59 @@ async def test_paragraph_keys_reveal_their_target_without_resuming_follow(
         region = text.reading_region(11)
         assert view.scroll_y <= region.y < view.scroll_y + view.size.height
         assert not view.following
+
+
+async def test_highlight_holds_the_seek_target_while_mpv_still_reports_the_old_position(
+    tmp_path, tts_endpoint, sse_audio
+):
+    class LaggingPlayer(FakePlayer):
+        """Reports the previous position for a while after each seek, as mpv can."""
+
+        async def seek(self, position):
+            self.seeks.append(position)
+            self.target = position
+
+        def catch_up(self):
+            self.position = self.target
+
+    body = "---\ntitle: Opening\n---\n" + "\n\n".join(f"Paragraph {i}." for i in range(10))
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, text=body)
+        return sse_audio(duration=2)
+
+    player = LaggingPlayer()
+    app = ReaderApp(
+        Settings(api_key="key", endpoint=tts_endpoint, cache_dir=tmp_path),
+        "https://example.test",
+        player=player,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    async with app.run_test() as pilot:
+        await app.prepare_worker.wait()
+        await pilot.pause()
+        text = app.query_one(ArticleText)
+        player.position = 12.5
+        await app.refresh_playback()
+        assert text.current == 6
+        await pilot.press("k", "k")
+        await pilot.pause(0.3)
+        assert player.seeks == [8]
+        for _ in range(3):
+            await app.refresh_playback()
+            assert text.current == 4  # Not back to paragraph 6.
+        player.catch_up()
+        await app.refresh_playback()
+        assert text.current == 4
+        assert app.held_position is None
+
+
+async def test_reading_keys_do_nothing_before_an_article_loads(tmp_path):
+    app = ReaderApp(Settings(cache_dir=tmp_path), player=FakePlayer(), client=httpx.AsyncClient())
+    async with app.run_test() as pilot:
+        app.query_one(ArticleView).focus()
+        await pilot.press("j", "k", "h", "l", "r", "f", "space", "ctrl+f", "ctrl+b", "left")
+        await pilot.pause(0.3)
+        assert app.is_running
+        assert app.query_one(ArticleText).current is None

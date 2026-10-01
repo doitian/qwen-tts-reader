@@ -139,3 +139,28 @@ async def test_real_mpv_restarts_reuse_cache_and_keep_time_continuous(
         assert app.position == pytest.approx(120, abs=0.3)
         assert "Paragraph 4." not in requests[:7]
         assert not app.generation_error
+
+
+async def test_back_to_back_restarts_keep_playing_once_the_target_arrives(
+    tmp_path, tts_endpoint, sse_audio
+):
+    requests, player = [], FakePlayer()
+    app = reader(tmp_path, tts_endpoint, sse_audio, requests, player)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: len(requests) == 4)
+        assert not player.paused
+        # The second restart starts while the first is still silent, waiting for its target.
+        await app.seek_paragraph(8)
+        await app.seek_paragraph(10)
+        await until(pilot, lambda: app.ready and app.timeline.anchor == 10)
+        await until(pilot, lambda: app.pending_selection is None)
+        assert not player.paused and not app.paused
+
+        # While paused, a restart stays paused; play/pause during the wait changes that.
+        await app.action_toggle_pause()
+        assert player.paused
+        await app.seek_paragraph(5)
+        await app.action_toggle_pause()
+        await until(pilot, lambda: app.ready and not app.restarting)
+        assert app.query_one("#article-text").current == 5
+        assert not player.paused
