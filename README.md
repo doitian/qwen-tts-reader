@@ -31,7 +31,7 @@ Paste a URL, then press **Enter** or click **Read**. Playback starts after rough
 
 Starting `uv run qwen-reader` without a URL reopens the last article and restores its playback position, speed, and pause state. Progress is saved every two seconds, after playback controls, when switching articles, and on quit. Each article/narration keeps its own position. Bookmarks store the paragraph and the offset into it, so restoring generates only from that paragraph; playback waits silently until the saved position is buffered. A finished article stays at the end, ready to replay with Space.
 
-Bookmarks live in `playback.json` inside `QWEN_READER_CACHE_DIR`. They contain article URLs, playback settings, and the model and voice chosen in the TUI, but no API keys or article text. Delete that file to clear saved progress. Changed article text, model, voice, or endpoint gets a separate bookmark because the audio timeline can differ.
+Bookmarks live in `playback.json` inside `QWEN_READER_CACHE_DIR`. They contain article URLs, playback settings, and the model and voice chosen in the TUI, but no API keys or article text. Delete that file to clear saved progress. Run `uv run qwen-reader purge-cache` to delete cached speech (paragraph and full-article audio) while keeping bookmarks, or add `--all` to also delete `playback.json`. It only removes files the reader created, and skips audio a running reader is still playing. Changed article text, model, voice, or endpoint gets a separate bookmark because the audio timeline can differ.
 
 | Control | Action |
 | --- | --- |

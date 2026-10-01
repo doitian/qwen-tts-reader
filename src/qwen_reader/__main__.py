@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,11 +12,34 @@ from dotenv import load_dotenv
 from .app import ReaderApp
 from .config import MODEL, MODEL_VOICES, Settings
 from .player import MpvPlayer
+from .synthesis import purge_cache
+
+
+def purge(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        prog="qwen-reader purge-cache",
+        description="Delete cached speech. Bookmarks and the saved model choice are kept.",
+    )
+    parser.add_argument(
+        "--all", action="store_true", help="Also delete bookmarks and the saved model choice"
+    )
+    args = parser.parse_args(argv)
+    load_dotenv()
+    cache_dir = Settings.from_env().cache_dir
+    removed, freed, busy = purge_cache(cache_dir, state=args.all)
+    print(f"Removed {removed} files ({freed / 1_000_000:.1f} MB) from {cache_dir}.")
+    if busy:
+        print(f"Kept {len(busy)} files in use; close the reader and run this again.")
 
 
 def main() -> None:
+    # The URL is an optional positional, which argparse subcommands cannot share.
+    if sys.argv[1:2] == ["purge-cache"]:
+        purge(sys.argv[2:])
+        return
     parser = argparse.ArgumentParser(
-        description="Read web articles aloud with selectable Qwen Audio TTS models."
+        description="Read web articles aloud with selectable Qwen Audio TTS models.",
+        epilog="Run `qwen-reader purge-cache` to delete cached speech (--help for options).",
     )
     parser.add_argument(
         "url", nargs="?", default="", help="Article URL (defaults to the last article)"

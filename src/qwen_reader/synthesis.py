@@ -79,6 +79,34 @@ def valid_wav(path: Path) -> bool:
         return False
 
 
+# Only names the reader creates, since the cache directory may be shared.
+SPEECH_FILES = ("chunk-*.wav", "article-*.wav", "article-*.json", "tmp*.partial", "tmp*.wav")
+STATE_FILES = ("playback.json", ".playback-*.tmp")
+
+
+def purge_cache(cache_dir: Path, *, state: bool = False) -> tuple[int, int, list[Path]]:
+    """Delete cached speech, and bookmarks too if `state`.
+
+    Returns how many files were removed, the bytes freed, and files left because
+    they are in use, such as audio a running reader is playing.
+    """
+    removed = freed = 0
+    busy = []
+    for pattern in SPEECH_FILES + (STATE_FILES if state else ()):
+        for path in cache_dir.glob(pattern):
+            if not path.is_file():
+                continue
+            size = path.stat().st_size
+            try:
+                path.unlink()
+            except PermissionError:
+                busy.append(path)
+                continue
+            removed += 1
+            freed += size
+    return removed, freed, busy
+
+
 def join_wavs(paths: list[Path], destination: Path) -> None:
     """Concatenate PCM frames, writing one correct WAV header atomically."""
     with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".wav", delete=False) as temp:

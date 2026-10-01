@@ -1,11 +1,13 @@
 import asyncio
 import json
+import sys
 
 import httpx
 import pytest
 
+from qwen_reader.__main__ import main
 from qwen_reader.config import MODEL, Settings
-from qwen_reader.synthesis import Synthesizer, join_wavs, valid_wav, wav_duration
+from qwen_reader.synthesis import Synthesizer, join_wavs, purge_cache, valid_wav, wav_duration
 
 
 async def test_api_contract_audio_concatenation_and_cache(tmp_path, sse_audio, tts_endpoint):
@@ -150,3 +152,21 @@ async def test_missing_endpoint_is_reported_before_network_request(tmp_path):
             await Synthesizer(Settings(api_key="test", cache_dir=tmp_path), client).synthesize(
                 "Hello", lambda *args: None
             )
+
+
+def test_purge_cache_deletes_only_reader_files_and_keeps_bookmarks(tmp_path, monkeypatch, capsys):
+    speech = ["chunk-a.wav", "article-b.wav", "article-b.json", "tmpx.partial", "tmpy.wav"]
+    for name in [*speech, "playback.json", ".playback-z.tmp", "notes.txt", "chunk-c.txt"]:
+        (tmp_path / name).write_bytes(b"x" * 1000)
+    monkeypatch.setenv("QWEN_READER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["qwen-reader", "purge-cache"])
+    main()
+    assert f"Removed 5 files (0.0 MB) from {tmp_path}." in capsys.readouterr().out
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        ".playback-z.tmp",
+        "chunk-c.txt",
+        "notes.txt",
+        "playback.json",
+    ]
+    assert purge_cache(tmp_path, state=True) == (2, 2000, [])
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["chunk-c.txt", "notes.txt"]
