@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+.cache/
+playback.json
+article-*.wav
+article-*.json
+chunk-*.wav
+*.partial
+dist/
+*.egg-info/
