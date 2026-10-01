@@ -71,11 +71,11 @@ def test_inline_runs_carry_marks_and_join_to_the_spoken_line():
         t for t in markdown_parser().parse("A **b *c*** `d` [e](x) ~~f~~") if t.type == "inline"
     )
     runs = inline_runs(token.children)
-    assert "".join(text for text, _ in runs) == "A b c d e f"
-    assert ("c", frozenset({"strong", "em"})) in runs
-    assert ("d", frozenset({"code"})) in runs
-    assert ("e", frozenset({"link"})) in runs
-    assert ("f", frozenset({"strike"})) in runs
+    assert "".join(run.text for run in runs) == "A b c d e f"
+    assert ("c", frozenset({"strong", "em"}), "") in runs
+    assert ("d", frozenset({"code"}), "") in runs
+    assert ("e", frozenset({"link"}), "x") in runs
+    assert ("f", frozenset({"strike"}), "") in runs
 
 
 def test_tables_and_strikethrough_are_spoken_without_markup():
@@ -142,3 +142,25 @@ async def test_glow_style_layout_and_split_paragraph_chunks_highlight_separately
         await pilot.click("#article-text", offset=(1, region.bottom - 1))
         await pilot.pause()
         assert app.selected == [long_units[2]]
+
+
+async def test_ctrl_click_opens_web_links_and_plain_click_still_seeks(monkeypatch):
+    markdown = "Read [the docs](https://example.com/docs) or [a file](file:///etc/passwd) here."
+    text = speech_text(markdown)
+    opened = []
+    app = Reader()
+    monkeypatch.setattr(app, "open_url", lambda url, **_: opened.append(url))
+    async with app.run_test(size=(60, 10)) as pilot:
+        view = app.query_one(ArticleText)
+        view.set_article(text, 1800, markdown)
+        view.highlight(0)  # Highlight styles must not drop the link.
+        await pilot.pause()
+        line = "".join(segment.text for segment in view.render_line(0))
+        docs, unsafe = line.index("the docs"), line.index("a file")
+        await pilot.click("#article-text", offset=(docs + 1, 0), control=True)
+        await pilot.click("#article-text", offset=(unsafe + 1, 0), control=True)
+        await pilot.click("#article-text", offset=(docs + 1, 0))
+        await pilot.pause()
+        assert opened == ["https://example.com/docs"]
+        # The unsafe link isn't a web link, so ctrl+click falls through to seeking, as does a click.
+        assert app.selected == [0, 0]

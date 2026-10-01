@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from markdown_it.tree import SyntaxTreeNode
 from rich import box
@@ -35,6 +36,12 @@ TITLE = Style(color="#ffff87", bgcolor="#5f5fff", bold=True)
 HEADING = Style(color="#00afff", bold=True)
 MUTED = Style(color="#6c7f93")
 CODE_BACKGROUND = "#182330"
+
+
+def web_link(href: str) -> bool:
+    """Only absolute web links open; article Markdown must not launch other schemes."""
+    url = urlsplit(href)
+    return url.scheme in ("http", "https") and bool(url.netloc)
 
 
 @dataclass
@@ -204,7 +211,7 @@ class Document:
         paragraphs = text.split("\n\n")
         # parse_article may prepend the title, which isn't part of the Markdown body.
         extra = len(paragraphs) - len(inline)
-        lines = ["".join(part for part, _ in runs) for _, runs in inline]
+        lines = ["".join(run.text for run in runs) for _, runs in inline]
         if extra not in (0, 1) or paragraphs[extra:] != lines:
             return cls.plain(text)
         starts = []
@@ -223,9 +230,11 @@ class Document:
                 return None
             start, runs = entry
             content = Text(overflow="fold", style=style or "")
-            for part, marks in runs:
-                styles = [MARK_STYLES[mark] for mark in sorted(marks)]
-                content.append(part, Style.combine(styles) if styles else None)
+            for run in runs:
+                styles = [MARK_STYLES[mark] for mark in sorted(run.marks)]
+                if web_link(run.href):
+                    styles.append(Style(meta={"href": run.href}))
+                content.append(run.text, Style.combine(styles) if styles else None)
             value = Spoken(start, len(content), content)
             spoken.append(value)
             return value

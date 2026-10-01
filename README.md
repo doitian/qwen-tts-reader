@@ -40,6 +40,7 @@ Bookmarks live in `playback.json` inside `QWEN_READER_CACHE_DIR`. They contain a
 | J / K | Seek to the next / previous paragraph |
 | − / + (or =) | Adjust speed by 0.1×, from 0.5× to 3.0× |
 | Click article text | Seek to the start of that paragraph |
+| Ctrl+click a link | Open its `http`/`https` URL in your browser |
 | R | Read from the first paragraph visible on screen and resume following |
 | Scroll wheel / ↑ ↓ / Page Up, Page Down / Ctrl+F, Ctrl+B / Home, End / scrollbar | Browse freely; stop automatic following |
 | F / Resume sync button | Bring the current paragraph into view and resume following |

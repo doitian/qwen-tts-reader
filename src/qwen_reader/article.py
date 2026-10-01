@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from html import unescape
+from typing import NamedTuple
 from urllib.parse import urldefrag, urlsplit
 
 import httpx
@@ -46,19 +47,33 @@ def markdown_parser() -> MarkdownIt:
     return MarkdownIt("commonmark", {"html": True}).enable("table").enable("strikethrough")
 
 
-def inline_runs(children: list[Token]) -> list[tuple[str, frozenset[str]]]:
-    """The spoken text of one inline block, as runs tagged with their formatting marks.
+class Run(NamedTuple):
+    text: str
+    marks: frozenset[str]
+    href: str = ""
+
+
+def inline_runs(children: list[Token]) -> list[Run]:
+    """The spoken text of one inline block, as runs tagged with their formatting and link.
 
     Joining the runs gives exactly the block's line in the speech text, so the
     display can show the same characters at the same offsets.
     """
-    chars: list[tuple[str, frozenset[str]]] = []
+    chars: list[tuple[str, frozenset[str], str]] = []
     marks: set[str] = set()
+    links: list[str] = []
     for child in children:
         kind = child.type.removesuffix("_open").removesuffix("_close")
         if kind in MARKS and kind != child.type:
-            (marks.add if child.type.endswith("_open") else marks.discard)(MARKS[kind])
+            opening = child.type.endswith("_open")
+            (marks.add if opening else marks.discard)(MARKS[kind])
+            if kind == "link":
+                if opening:
+                    links.append(str(child.attrGet("href") or ""))
+                elif links:
+                    links.pop()
             continue
+        href = links[-1] if links else ""
         if child.type == "text":
             piece, current = unescape(child.content), frozenset(marks)
         elif child.type == "code_inline":
@@ -67,28 +82,28 @@ def inline_runs(children: list[Token]) -> list[tuple[str, frozenset[str]]]:
             piece, current = " ", frozenset(marks)
         else:
             continue
-        chars.extend((char, current) for char in piece)
-    collapsed: list[tuple[str, frozenset[str]]] = []
-    for char, current in chars:
+        chars.extend((char, current, href) for char in piece)
+    collapsed: list[tuple[str, frozenset[str], str]] = []
+    for char, current, href in chars:
         if char.isspace():
             if collapsed and collapsed[-1][0] == " ":
                 continue
-            collapsed.append((" ", current))
+            collapsed.append((" ", current, href))
         else:
-            collapsed.append((char, current))
+            collapsed.append((char, current, href))
     while collapsed and collapsed[0][0] == " ":
         collapsed.pop(0)
     while collapsed and collapsed[-1][0] == " ":
         collapsed.pop()
     # Terminal escape/control characters are never useful in article prose.
-    runs: list[tuple[str, frozenset[str]]] = []
-    for char, current in collapsed:
+    runs: list[Run] = []
+    for char, current, href in collapsed:
         if CONTROL.match(char):
             continue
-        if runs and runs[-1][1] == current:
-            runs[-1] = (runs[-1][0] + char, current)
+        if runs and runs[-1][1:] == (current, href):
+            runs[-1] = Run(runs[-1].text + char, current, href)
         else:
-            runs.append((char, current))
+            runs.append(Run(char, current, href))
     return runs
 
 
@@ -97,7 +112,7 @@ def speech_text(markdown: str) -> str:
     blocks = []
     for token in markdown_parser().parse(markdown):
         if token.type == "inline":
-            line = "".join(text for text, _ in inline_runs(token.children or []))
+            line = "".join(run.text for run in inline_runs(token.children or []))
             if line:
                 blocks.append(line)
     return "\n\n".join(blocks)

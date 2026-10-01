@@ -71,6 +71,12 @@ class ArticleText(Static):
             self.redraw()
 
     def on_click(self, event: events.Click) -> None:
+        href = event.style.meta.get("href")
+        if event.ctrl and isinstance(href, str):
+            event.stop()
+            self.app.open_url(href)
+            self.notify(f"Opening {href}")
+            return
         index = event.style.meta.get("reading_unit")
         if isinstance(index, int) and 0 <= index < len(self.spans):
             event.stop()
