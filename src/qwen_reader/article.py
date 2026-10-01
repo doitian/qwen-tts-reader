@@ -8,6 +8,7 @@ from urllib.parse import urldefrag, urlsplit
 import httpx
 import yaml
 from markdown_it import MarkdownIt
+from markdown_it.token import Token
 
 
 @dataclass(frozen=True)
@@ -37,24 +38,68 @@ def normalize_url(value: str) -> str:
     return urldefrag(value)[0]
 
 
+MARKS = {"strong": "strong", "em": "em", "s": "strike", "link": "link"}
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def markdown_parser() -> MarkdownIt:
+    return MarkdownIt("commonmark", {"html": True}).enable("table").enable("strikethrough")
+
+
+def inline_runs(children: list[Token]) -> list[tuple[str, frozenset[str]]]:
+    """The spoken text of one inline block, as runs tagged with their formatting marks.
+
+    Joining the runs gives exactly the block's line in the speech text, so the
+    display can show the same characters at the same offsets.
+    """
+    chars: list[tuple[str, frozenset[str]]] = []
+    marks: set[str] = set()
+    for child in children:
+        kind = child.type.removesuffix("_open").removesuffix("_close")
+        if kind in MARKS and kind != child.type:
+            (marks.add if child.type.endswith("_open") else marks.discard)(MARKS[kind])
+            continue
+        if child.type == "text":
+            piece, current = unescape(child.content), frozenset(marks)
+        elif child.type == "code_inline":
+            piece, current = unescape(child.content), frozenset(marks | {"code"})
+        elif child.type in ("softbreak", "hardbreak"):
+            piece, current = " ", frozenset(marks)
+        else:
+            continue
+        chars.extend((char, current) for char in piece)
+    collapsed: list[tuple[str, frozenset[str]]] = []
+    for char, current in chars:
+        if char.isspace():
+            if collapsed and collapsed[-1][0] == " ":
+                continue
+            collapsed.append((" ", current))
+        else:
+            collapsed.append((char, current))
+    while collapsed and collapsed[0][0] == " ":
+        collapsed.pop(0)
+    while collapsed and collapsed[-1][0] == " ":
+        collapsed.pop()
+    # Terminal escape/control characters are never useful in article prose.
+    runs: list[tuple[str, frozenset[str]]] = []
+    for char, current in collapsed:
+        if CONTROL.match(char):
+            continue
+        if runs and runs[-1][1] == current:
+            runs[-1] = (runs[-1][0] + char, current)
+        else:
+            runs.append((char, current))
+    return runs
+
+
 def speech_text(markdown: str) -> str:
     """Keep prose and link labels; skip code, images, and formatting syntax."""
     blocks = []
-    parser = MarkdownIt("commonmark", {"html": True})
-    for token in parser.parse(markdown):
-        if token.type != "inline":
-            continue
-        parts = []
-        for child in token.children or []:
-            if child.type in ("text", "code_inline"):
-                parts.append(child.content)
-            elif child.type in ("softbreak", "hardbreak"):
-                parts.append(" ")
-        line = re.sub(r"\s+", " ", unescape("".join(parts))).strip()
-        # Terminal escape/control characters are never useful in article prose.
-        line = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", line)
-        if line:
-            blocks.append(line)
+    for token in markdown_parser().parse(markdown):
+        if token.type == "inline":
+            line = "".join(text for text, _ in inline_runs(token.children or []))
+            if line:
+                blocks.append(line)
     return "\n\n".join(blocks)
 
 

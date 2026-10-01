@@ -279,7 +279,9 @@ class ReaderApp(App):
                     )
                 )
             )
-            self.query_one(ArticleText).set_article(article.text, self.settings.chunk_chars)
+            self.query_one(ArticleText).set_article(
+                article.text, self.settings.chunk_chars, article.markdown
+            )
             self.query_one("#article-view", VerticalScroll).scroll_home(animate=False)
             self.current_url = url
             self.narration_id = self.synthesizer.cache_path(article.text, "article").stem

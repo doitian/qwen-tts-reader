@@ -9,11 +9,12 @@ from textual.message import Message
 from textual.scrollbar import ScrollDown, ScrollTo, ScrollUp
 from textual.widgets import Static
 
+from .markdown_view import Document, Spoken
 from .narration import TextSpan, narration_spans
 
 
 class ArticleText(Static):
-    """Clickable reading units, with their metadata preserved through line wrapping."""
+    """Rendered article with clickable reading units, whose metadata survives line wrapping."""
 
     ALLOW_SELECT = False
 
@@ -28,27 +29,41 @@ class ArticleText(Static):
         self.spans: list[TextSpan] = []
         self.current: int | None = None
         self.pending: int | None = None
+        self.document: Document | None = None
         self._line_ranges: dict[int, tuple[int, int]] = {}
         self._line_size = (0, 0)
 
-    def set_article(self, text: str, limit: int) -> None:
+    def set_article(self, text: str, limit: int, markdown: str | None = None) -> None:
         self.text = text
         self.spans = narration_spans(text, limit)
+        self.document = Document.from_markdown(markdown, text) if markdown else Document.plain(text)
+        for spoken in self.document.spoken:
+            end = spoken.start + spoken.length
+            spoken.units = [
+                index
+                for index, span in enumerate(self.spans)
+                if span.start < end and span.end > spoken.start
+            ]
         self.current = self.pending = None
         self._line_ranges.clear()
         self._line_size = (0, 0)
         self.redraw()
 
     def redraw(self) -> None:
-        text = Text(self.text, overflow="fold")
-        for index, span in enumerate(self.spans):
+        if self.document:
+            self.update(self.document.render(self.styled))
+
+    def styled(self, spoken: Spoken) -> Text:
+        text = spoken.text.copy()
+        for index in spoken.units:
+            span = self.spans[index]
             style = Style(meta={"reading_unit": index})
             if index == self.current:
                 style += Style(color="#111821", bgcolor="#83dfcd", bold=True)
             elif index == self.pending:
                 style += Style(color="#f1ce83", underline=True)
-            text.stylize(style, span.start, span.end)
-        self.update(text)
+            text.stylize(style, max(0, span.start - spoken.start), span.end - spoken.start)
+        return text
 
     def highlight(self, index: int | None, pending: int | None = None) -> None:
         if (index, pending) != (self.current, self.pending):

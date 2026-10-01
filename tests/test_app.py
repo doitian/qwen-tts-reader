@@ -137,7 +137,11 @@ async def test_missing_key_still_shows_article_and_keeps_app_alive(
         await pilot.pause()
         assert not app.ready
         assert "QWEN_TTS_API_KEY" in str(app.query_one("#status", Static).render())
-        assert "interesting story" in str(app.query_one("#article-text", Static).render())
+        article = app.query_one("#article-text", Static)
+        shown = "".join(
+            segment.text for y in range(article.size.height) for segment in article.render_line(y)
+        )
+        assert "interesting story" in shown
 
 
 async def test_cancel_and_replace_an_inflight_article(tmp_path, sse_audio, tts_endpoint):
