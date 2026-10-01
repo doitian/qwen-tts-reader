@@ -24,7 +24,7 @@ from .article_view import ArticleText, ArticleView
 from .config import MODEL_VOICES, Settings
 from .model_screen import ModelScreen
 from .narration import Cue
-from .playback_state import Bookmark, PlaybackState
+from .playback_state import Bookmark, ModelChoice, PlaybackState
 from .player import MpvPlayer, PlayerError
 from .screens import ReaderCommandPalette
 from .synthesis import Synthesizer
@@ -106,7 +106,15 @@ class ReaderApp(App):
         last = self.playback_state.get(
             self.playback_state.last_url, self.playback_state.last_narration
         )
+        choice = self.playback_state.choice
         if (
+            restore_choices
+            and choice
+            and choice.configuration == self.startup_configuration
+            and choice.model in MODEL_VOICES
+        ):
+            settings = replace(settings, model=choice.model, voice=choice.voice)
+        elif (
             not url
             and restore_choices
             and last
@@ -750,6 +758,13 @@ class ReaderApp(App):
         self.cleanup_spool()
         self.settings = replace(self.settings, model=model, voice=voice)
         self.synthesizer = Synthesizer(self.settings, self.client)
+        try:
+            self.playback_state.save_choice(ModelChoice(model, voice, self.startup_configuration))
+        except OSError:
+            self.notify(
+                "Could not save the model choice. Check the cache directory permissions.",
+                severity="warning",
+            )
         self.position = self.duration = 0
         self.reset_reading()
         self.query_one("#progress", ProgressBar).update(total=100, progress=0)

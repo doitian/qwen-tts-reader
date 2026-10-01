@@ -7,13 +7,14 @@ import httpx
 import pytest
 from test_app import FakePlayer, mock_services
 from test_streaming import STOP, ByteStream, pcm_event
-from textual.widgets import Input
+from textual.widgets import Input, Select
 
 from qwen_reader.app import ReaderApp
 from qwen_reader.article import parse_article
 from qwen_reader.article_view import ArticleText
-from qwen_reader.config import Settings
-from qwen_reader.playback_state import Bookmark, PlaybackState
+from qwen_reader.config import MODEL, Settings
+from qwen_reader.model_screen import CUSTOM_VOICE
+from qwen_reader.playback_state import Bookmark, ModelChoice, PlaybackState
 from qwen_reader.synthesis import Synthesizer
 
 
@@ -241,3 +242,38 @@ async def test_restart_remembers_tui_voice_but_respects_explicit_config_changes(
         reader = ReaderApp(configured, restore_choices=restore_choices)
         assert reader.settings.voice_id == expected
         await reader.client.aclose()
+
+
+async def test_tui_model_choice_persists_for_new_sessions_unless_config_changes(tmp_path):
+    settings = Settings(cache_dir=tmp_path)
+    app = ReaderApp(settings, player=FakePlayer(), client=httpx.AsyncClient())
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.click("#choose-model")
+        await pilot.pause()
+        picker = app.screen
+        picker.query_one("#model-choice", Select).value = "qwen-audio-3.0-tts-plus"
+        await pilot.pause()
+        picker.query_one("#voice-choice", Select).value = CUSTOM_VOICE
+        await pilot.pause()
+        picker.query_one("#voice-custom", Input).value = "my-plus-clone"
+        await pilot.click("#model-apply")
+        await pilot.pause()
+        assert app.settings.voice == "my-plus-clone"
+    chosen = ("qwen-audio-3.0-tts-plus", "my-plus-clone")
+    flash = replace(settings, model="qwen-audio-3.0-tts-flash")
+    for configured, url, restore_choices, expected in [
+        (settings, "", True, chosen),
+        (settings, "https://other.test", True, chosen),
+        (settings, "", False, (MODEL, "")),  # --model / --voice on the command line
+        (flash, "", True, ("qwen-audio-3.0-tts-flash", "")),  # .env edited since the choice
+    ]:
+        reader = ReaderApp(configured, url, restore_choices=restore_choices)
+        assert (reader.settings.model, reader.settings.voice) == expected
+        await reader.client.aclose()
+
+    path = tmp_path / "playback.json"
+    assert PlaybackState(path).choice == ModelChoice(*chosen, app.startup_configuration)
+    data = json.loads(path.read_text())
+    data["choice"] = {"model": 5, "voice": "", "configuration": ""}
+    path.write_text(json.dumps(data))
+    assert PlaybackState(path).choice is None

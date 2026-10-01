@@ -31,7 +31,7 @@ Paste a URL, then press **Enter** or click **Read**. Playback starts after rough
 
 Starting `uv run qwen-reader` without a URL reopens the last article and restores its playback position, speed, and pause state. Progress is saved every two seconds, after playback controls, when switching articles, and on quit. Each article/narration keeps its own position. If audio must be regenerated, playback waits silently until the saved position is buffered. A finished article stays at the end, ready to replay with Space.
 
-Bookmarks live in `playback.json` inside `QWEN_READER_CACHE_DIR`. They contain article URLs and playback settings, but no API keys or article text. Delete that file to clear saved progress. Changed article text, model, voice, or endpoint gets a separate bookmark because the audio timeline can differ.
+Bookmarks live in `playback.json` inside `QWEN_READER_CACHE_DIR`. They contain article URLs, playback settings, and the model and voice chosen in the TUI, but no API keys or article text. Delete that file to clear saved progress. Changed article text, model, voice, or endpoint gets a separate bookmark because the audio timeline can differ.
 
 | Control | Action |
 | --- | --- |
@@ -70,7 +70,7 @@ uv run qwen-reader --model qwen-audio-3.0-tts-plus 'https://stephango.com/saw'
 
 The **Voice** dropdown shows system voice names and IDs for the selected model. Choose **Default** to use its default voice, or **Custom voice ID…** for a cloned or additional base voice. Switching models resets the voice to a compatible default. The bundled system voice list comes from the [official voice catalog](https://help.aliyun.com/zh/model-studio/qwen-audio-tts-voice-list).
 
-Applying a different model or voice stops playback; press Read to use the selection. Reopening the last session without a URL also restores the model and voice used for that narration. Explicit `--model` / `--voice` options or changed environment configuration take precedence. Set environment variables for your default choices. These are the three supported streaming models; TTS Next is excluded because it does not stream.
+Applying a different model or voice stops playback; press Read to use the selection. The choice is saved in `playback.json` and used for later sessions, with or without a URL. Without a saved choice, reopening the last session without a URL restores the model and voice used for that narration. Explicit `--model` / `--voice` options take precedence, and so does editing `QWEN_TTS_MODEL`, `QWEN_TTS_VOICE`, or `QWEN_TTS_ENDPOINT` after making the choice. These are the three supported streaming models; TTS Next is excluded because it does not stream.
 
 ## Configuration
 

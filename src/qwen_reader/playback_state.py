@@ -5,7 +5,7 @@ import json
 import math
 import os
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, astuple, dataclass
 from pathlib import Path
 
 from .article import normalize_url
@@ -24,6 +24,15 @@ class Bookmark:
     configuration: str = ""
 
 
+@dataclass(frozen=True)
+class ModelChoice:
+    """The model and voice last applied in the TUI, valid while startup config is unchanged."""
+
+    model: str
+    voice: str
+    configuration: str
+
+
 class PlaybackState:
     """Atomic, private progress file; credentials and article text aren't stored."""
 
@@ -32,6 +41,7 @@ class PlaybackState:
         self.last_url = ""
         self.last_narration = ""
         self.bookmarks: dict[str, Bookmark] = {}
+        self.choice: ModelChoice | None = None
         try:
             data = json.loads(path.read_text())
             if data.get("version") != 1:
@@ -58,6 +68,14 @@ class PlaybackState:
                 except (TypeError, ValueError, AttributeError):
                     continue
                 self.bookmarks[self.key(bookmark.url, bookmark.narration)] = bookmark
+            choice = data.get("choice")
+            if isinstance(choice, dict):
+                try:
+                    value = ModelChoice(**choice)
+                    if all(isinstance(field, str) for field in astuple(value)):
+                        self.choice = value
+                except TypeError:
+                    pass
             last_url = data.get("last_url", "")
             if any(bookmark.url == last_url for bookmark in self.bookmarks.values()):
                 self.last_url = last_url
@@ -76,6 +94,13 @@ class PlaybackState:
         self.bookmarks[self.key(bookmark.url, bookmark.narration)] = bookmark
         self.last_url = bookmark.url
         self.last_narration = bookmark.narration
+        self.write()
+
+    def save_choice(self, choice: ModelChoice) -> None:
+        self.choice = choice
+        self.write()
+
+    def write(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary: Path | None = None
         try:
@@ -89,6 +114,7 @@ class PlaybackState:
                         "last_url": self.last_url,
                         "last_narration": self.last_narration,
                         "bookmarks": [asdict(value) for value in self.bookmarks.values()],
+                        "choice": asdict(self.choice) if self.choice else None,
                     },
                     output,
                 )
