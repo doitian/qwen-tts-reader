@@ -151,15 +151,18 @@ async def test_restore_waits_silently_for_target_without_overwriting_bookmark(
     def handler(request):
         if request.method == "GET":
             return httpx.Response(200, text=body)
+        requests.append(json.loads(request.content)["input"]["text"])
         return httpx.Response(
             200, headers={"content-type": "text/event-stream"}, stream=Delayed([])
         )
 
+    requests = []
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     narration = (
         Synthesizer(settings, client).cache_path(parse_article(url, body).text, "article").stem
     )
-    original = Bookmark(url, narration, 4.25, 1.2, False)
+    # 1.25s into the second paragraph; the first has never been generated.
+    original = Bookmark(url, narration, 4.25, 1.2, False, unit=1, unit_offset=1.25)
     PlaybackState(tmp_path / "playback.json").save(original)
     app = ReaderApp(settings, player=FakePlayer(), client=client)
     async with app.run_test() as pilot:
@@ -173,7 +176,9 @@ async def test_restore_waits_silently_for_target_without_overwriting_bookmark(
         gate.set()
         await app.prepare_worker.wait()
         await pilot.pause()
-        assert app.player.position == 4.25
+        # The playlist starts at the restored paragraph; earlier ones are not generated.
+        assert requests == ["Second."]
+        assert app.player.position == 1.25
         assert not app.player.paused
         assert app.restoring is None
 

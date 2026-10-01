@@ -22,6 +22,9 @@ class Bookmark:
     model: str = ""
     voice: str = ""
     configuration: str = ""
+    # The reading unit and offset into it; position alone may be an estimate. -1: older file.
+    unit: int = -1
+    unit_offset: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,11 @@ class PlaybackState:
                         or not 0.5 <= bookmark.speed <= 3
                         or type(bookmark.paused) is not bool
                         or type(bookmark.completed) is not bool
+                        or type(bookmark.unit) is not int
+                        or bookmark.unit < -1
+                        or not isinstance(bookmark.unit_offset, int | float)
+                        or not math.isfinite(bookmark.unit_offset)
+                        or bookmark.unit_offset < 0
                         or not all(
                             isinstance(value, str)
                             for value in (bookmark.model, bookmark.voice, bookmark.configuration)

@@ -146,27 +146,46 @@ class MpvPlayer:
             await self.wait_loaded(path)
             await self.command("set_property", "pause", paused)
 
-    async def wait_loaded(self, path: Path) -> None:
+    async def wait_loaded(self, path: Path, index: int | None = None) -> bool:
+        """Wait until `path` is the current file with audio ready.
+
+        Returns False if mpv already moved past playlist entry `index`: a file shorter
+        than its audio buffer is decoded at once, even paused, and gapless playback then
+        makes the next file current while the short one's audio is still queued.
+        """
         # loadfile is asynchronous; wait until the file and audio output are ready.
-        async with asyncio.timeout(8):
-            while True:
-                try:
-                    loaded_path = await self.command("get_property", "path")
-                    if loaded_path == str(path.resolve()):
-                        await self.command("get_property", "time-pos")
-                        if await self.command("get_property", "audio-out-params"):
-                            return
-                except PlayerError as exc:
-                    if "property unavailable" not in str(exc):
-                        raise
-                if await self.command("get_property", "idle-active"):
-                    raise PlayerError("mpv could not open the audio. Check your sound device.")
-                await asyncio.sleep(0.05)
+        try:
+            async with asyncio.timeout(8):
+                while True:
+                    try:
+                        loaded_path = await self.command("get_property", "path")
+                        if loaded_path == str(path.resolve()):
+                            await self.command("get_property", "time-pos")
+                            if await self.command("get_property", "audio-out-params"):
+                                return True
+                        elif index is not None and (
+                            await self.command("get_property", "playlist-pos") > index
+                        ):
+                            return False
+                    except PlayerError as exc:
+                        if "property unavailable" not in str(exc):
+                            raise
+                    if await self.command("get_property", "idle-active"):
+                        raise PlayerError("mpv could not open the audio. Check your sound device.")
+                    await asyncio.sleep(0.05)
+        except TimeoutError as exc:
+            raise PlayerError("mpv did not load the audio in time. Restart the reader.") from exc
 
     async def append(self, path: Path, duration: float) -> None:
         """Queue the next segment; resume automatically if playback ran out of audio."""
         async with self.playback_lock:
-            ended = await self.command("get_property", "eof-reached")
+            try:
+                ended = await self.command("get_property", "eof-reached")
+            except PlayerError as exc:
+                if "property unavailable" not in str(exc):
+                    raise
+                # Briefly unavailable while mpv switches files, when audio hasn't run out.
+                ended = False
             index = await self.command("get_property", "playlist-pos")
             was_last = index == len(self.parts) - 1
             await self.command("loadfile", str(path.resolve()), "append")
@@ -235,11 +254,14 @@ class MpvPlayer:
                 if remaining < duration or index == len(self.parts) - 1:
                     break
                 remaining -= duration
+            current = True
             if index != await self.command("get_property", "playlist-pos"):
                 await self.command("set_property", "pause", True)
                 await self.command("playlist-play-index", index)
-                await self.wait_loaded(self.parts[index][0])
-            await self.command("seek", remaining, "absolute+exact")
+                current = await self.wait_loaded(self.parts[index][0], index)
+            # A part mpv already moved past is too short to seek within; play it from its start.
+            if current:
+                await self.command("seek", remaining, "absolute+exact")
             await self.command("set_property", "pause", self.user_paused)
 
     async def set_speed(self, speed: float) -> None:

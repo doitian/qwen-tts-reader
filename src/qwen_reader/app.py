@@ -15,6 +15,7 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.timer import Timer
 from textual.widgets import Button, Footer, Header, Input, ProgressBar, Static
 from textual.worker import Worker, WorkerCancelled, WorkerFailed
@@ -23,15 +24,18 @@ from .article import fetch_article, normalize_url
 from .article_view import ArticleText, ArticleView
 from .config import MODEL_VOICES, Settings
 from .model_screen import ModelScreen
-from .narration import Cue
+from .narration import Cue, TextSpan
 from .playback_state import Bookmark, ModelChoice, PlaybackState
 from .player import MpvPlayer, PlayerError
 from .screens import ReaderCommandPalette
 from .synthesis import Synthesizer
+from .timeline import Timeline
 
 log = logging.getLogger(__name__)
 
 SEEK_DEBOUNCE = 0.25
+# Generate at most this much listening time ahead of playback, in seconds.
+LOOKAHEAD = 180
 
 
 def timestamp(seconds: float) -> str:
@@ -153,6 +157,15 @@ class ReaderApp(App):
         self.seek_target: float | None = None
         self.seek_timer: Timer | None = None
         self.playing_sample: tuple[float, float] | None = None
+        self.timeline = Timeline([])
+        self.article_text = ""
+        self.spans: list[TextSpan] = []
+        self.unit_of: dict[int, int] = {}
+        self.window_cued = False
+        self.streaming_unit = -1
+        self.pending_offset = 0.0
+        self.unpause_after_seek = False
+        self.restore_target: tuple[int, float] = (0, 0.0)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -279,73 +292,189 @@ class ReaderApp(App):
                     )
                 )
             )
-            self.query_one(ArticleText).set_article(
-                article.text, self.settings.chunk_chars, article.markdown
-            )
+            text = self.query_one(ArticleText)
+            text.set_article(article.text, self.settings.chunk_chars, article.markdown)
             self.query_one("#article-view", VerticalScroll).scroll_home(animate=False)
             self.current_url = url
+            self.article_text = article.text
+            self.spans = text.spans
+            self.unit_of = {span.start: index for index, span in enumerate(self.spans)}
+            self.timeline = Timeline(
+                [span.end - span.start for span in text.spans],
+                self.synthesizer.known_durations(article.text),
+                article.text,
+            )
             self.narration_id = self.synthesizer.cache_path(article.text, "article").stem
             self.restoring = self.playback_state.get(url, self.narration_id)
             if self.restoring:
                 self.speed = self.restoring.speed
                 self.query_one("#speed", Static).update(f"{self.speed:.1f}×")
+                self.restore_target = self.bookmark_target(self.restoring)
             self.settings.validate_tts()
-            await self.player.start()
-            stream = self.synthesizer.stream(
-                article.text, self.synthesis_progress, Path(self.spool.name), self.receive_cue
-            )
-            async with contextlib.aclosing(stream):
-                async for part in stream:
-                    if not self.is_running:
-                        raise asyncio.CancelledError
-                    if not self.ready:
-                        await self.player.load(
-                            part.path, self.speed, paused=self.restoring is not None
-                        )
-                        await self.player.set_speed(self.speed)
-                        self.paused = self.restoring is not None
-                        self.ended = False
-                        self.playback_loaded = True
-                        self.set_ready(True)
-                    else:
-                        await self.player.append(part.path, part.duration)
-                    self.duration += part.duration
-                    log.debug(
-                        "received %s (%.2fs); %.2fs buffered ahead of %.2fs",
-                        part.path.name,
-                        part.duration,
-                        self.duration - self.position,
-                        self.position,
-                    )
-                    await self.restore_position()
-                    await self.apply_pending_seek()
-                    await self.checkpoint()
-                    self.update_reading()
-                    self.query_one("#progress", ProgressBar).update(
-                        total=self.duration, progress=self.position
-                    )
-                    self.update_playback_status()
-            self.generation_complete = True
-            await self.restore_position(final=True)
+            await self.stream_window(self.restore_target[0] if self.restoring else 0)
         except asyncio.CancelledError:
             raise
-        except httpx.HTTPStatusError as exc:
-            self.generation_error = f"Request failed (HTTP {exc.response.status_code}). Try again."
-        except httpx.RequestError:
-            self.generation_error = "Network request failed. Check your connection and try again."
-        except (ValueError, OSError, PlayerError, TimeoutError) as exc:
-            self.generation_error = str(exc) or "Audio preparation timed out. Try again."
+        except (httpx.HTTPError, ValueError, OSError, PlayerError, TimeoutError) as exc:
+            self.generation_error = self.describe_failure(exc)
         finally:
-            self.preparing = False
-            self.pending_selection = None
-            if self.is_running:
-                self.update_reading()
+            self.finish_preparing()
+
+    @work(exclusive=True, group="prepare")
+    async def restart_window(
+        self, unit: int, offset: float, paused: bool, previous: Worker | None = None
+    ) -> None:
+        if previous:
+            with contextlib.suppress(WorkerCancelled, WorkerFailed):
+                await previous.wait()
+        self.restoring = None
+        self.pending_selection, self.pending_offset = unit, offset
+        try:
+            await self.stream_window(unit, paused=paused)
+        except asyncio.CancelledError:
+            raise
+        except (httpx.HTTPError, ValueError, OSError, PlayerError, TimeoutError) as exc:
+            self.generation_error = self.describe_failure(exc)
+        finally:
+            self.finish_preparing()
+
+    def restart_at(self, unit: int, offset: float = 0.0, *, paused: bool | None = None) -> None:
+        """Replace the playlist with one from which `unit` (plus `offset`) can play."""
+        log.info("restarting playback at unit %d + %.2fs", unit, offset)
+        self.position = self.timeline.start(unit) + offset
+        self.prepare_worker = self.restart_window(
+            unit, offset, self.paused if paused is None else paused, self.prepare_worker
+        )
+
+    async def stream_window(self, unit: int, *, paused: bool = False) -> None:
+        """Play from the cached run just before `unit`, then stream on while there is room.
+
+        Earlier paragraphs are never generated, but cached ones join the playlist,
+        so seeking back into them needs no restart.
+        """
+        anchor = unit
+        while anchor > 0 and anchor - 1 in self.timeline.known:
+            anchor -= 1
+        self.preparing = True
+        self.generation_complete = False
+        self.generation_error = ""
+        self.playback_loaded = False
+        self.set_ready(False)
+        self.cues.clear()
+        self.window_cued = False
+        self.streaming_unit = -1
+        self.timeline.set_anchor(anchor)
+        self.duration = self.timeline.anchor_time
+        if self.restoring is None and self.pending_selection is None:
+            self.position = self.duration
+        await self.player.stop()
+        self.cleanup_spool()
+        # On Windows, files mpv still holds open cannot be deleted.
+        self.spool = tempfile.TemporaryDirectory(prefix="qwen-stream-", ignore_cleanup_errors=True)
+        await self.player.start()
+        stream = self.synthesizer.stream(
+            self.article_text,
+            self.synthesis_progress,
+            Path(self.spool.name),
+            self.receive_cue,
+            first=anchor,
+            room=self.has_room,
+        )
+        async with contextlib.aclosing(stream):
+            async for part in stream:
+                if not self.is_running:
+                    raise asyncio.CancelledError
                 if not self.ready:
-                    self.query_one("#progress", ProgressBar).update(total=100, progress=0)
-                if self.generation_error:
-                    self.set_status(self.generation_error, error=True)
-                elif self.ready:
+                    # Stay silent until a restore or a seek reaches its target.
+                    waiting = self.restoring is not None or self.pending_selection is not None
+                    await self.player.load(part.path, self.speed, paused=paused or waiting)
+                    await self.player.set_speed(self.speed)
+                    self.paused = paused or waiting
+                    self.unpause_after_seek = waiting and not paused and self.restoring is None
+                    self.ended = False
+                    self.playback_loaded = True
+                    self.set_ready(True)
+                else:
+                    await self.player.append(part.path, part.duration)
+                self.duration += part.duration
+                log.debug(
+                    "received %s (%.2fs); %.2fs buffered ahead of %.2fs",
+                    part.path.name,
+                    part.duration,
+                    self.duration - self.position,
+                    self.position,
+                )
+                await self.restore_position()
+                await self.apply_pending_seek()
+                await self.checkpoint()
+                try:
+                    self.update_reading()
+                    self.query_one("#progress", ProgressBar).update(
+                        total=self.timeline.total(), progress=self.position
+                    )
                     self.update_playback_status()
+                except NoMatches:
+                    # The screen is gone before on_unmount cancels this worker.
+                    raise asyncio.CancelledError from None
+        self.generation_complete = True
+        await self.restore_position(final=True)
+        await self.apply_pending_seek(final=True)
+
+    def describe_failure(self, exc: BaseException) -> str:
+        if isinstance(exc, httpx.HTTPStatusError):
+            return f"Request failed (HTTP {exc.response.status_code}). Try again."
+        if isinstance(exc, httpx.HTTPError):
+            return "Network request failed. Check your connection and try again."
+        return str(exc) or "Audio preparation timed out. Try again."
+
+    def finish_preparing(self) -> None:
+        self.preparing = False
+        self.pending_selection = None
+        if self.is_running:
+            self.update_reading()
+            if not self.ready:
+                self.query_one("#progress", ProgressBar).update(total=100, progress=0)
+            if self.generation_error:
+                self.set_status(self.generation_error, error=True)
+            elif self.ready:
+                self.update_playback_status()
+
+    def has_room(self) -> bool:
+        # Until a restore or seek reaches its target, keep streaming toward it.
+        if self.restoring is not None or self.pending_selection is not None:
+            return True
+        return self.duration - self.position < LOOKAHEAD * self.speed
+
+    def bookmark_target(self, bookmark: Bookmark) -> tuple[int, float]:
+        last = len(self.timeline.lengths) - 1
+        if bookmark.completed:
+            return last, self.timeline.duration(last)
+        if 0 <= bookmark.unit <= last:
+            return bookmark.unit, bookmark.unit_offset
+        # Older bookmarks store only seconds; their earlier paragraphs are cached.
+        return self.timeline.locate(bookmark.position)
+
+    def position_unit(self, position: float) -> tuple[int | None, float]:
+        """The unit playing at a whole-article `position`, and the offset into it."""
+        if not self.spans:
+            return None, 0.0
+        if self.timeline.anchor_time <= position < max(self.duration, self.timeline.anchor_time):
+            current = None
+            for index, span in enumerate(self.spans[self.timeline.anchor :], self.timeline.anchor):
+                cue = self.cues.get(span.start)
+                if cue is None or cue.time > position + 0.001:
+                    break
+                current = (index, position - cue.time)
+            if current:
+                return current
+        return self.timeline.locate(position)
+
+    def near_live_edge(self, unit: int) -> bool:
+        """Whether streaming will reach `unit` next, so waiting beats restarting."""
+        return (
+            self.preparing
+            and self.window_cued
+            and self.timeline.anchor <= unit <= self.streaming_unit + 1
+        )
 
     def synthesis_progress(self, done: int, total: int, message: str) -> None:
         if not self.is_running:
@@ -360,6 +489,9 @@ class ReaderApp(App):
         state = "Paused" if self.paused else "Buffering…" if buffering else "Playing"
         if self.ended:
             state = "Finished · Space to replay"
+        current = next((text.current for text in self.query(ArticleText)), None)
+        if current is not None:
+            state = f"Paragraph {current + 1}/{len(self.spans)} · {state}"
         if self.generation_error:
             self.set_status(f"{state} received audio · {self.generation_error}", error=True)
         elif self.restoring:
@@ -380,7 +512,7 @@ class ReaderApp(App):
         if not self.ready or not self.is_running or self.closing:
             return
         try:
-            position, paused, ended = await self.player.status()
+            position, paused, ended = await self.player_status()
         except PlayerError as exc:
             if not self.ready or not self.is_running:
                 return
@@ -394,17 +526,17 @@ class ReaderApp(App):
             position, ended = self.seek_target, False
         self.position, self.paused = position, paused
         self.ended = self.restored_finished or (ended and not self.preparing)
-        position = self.duration if self.ended else min(self.position, self.duration)
-        self.query_one("#progress", ProgressBar).update(progress=position)
+        position = self.duration if self.ended else self.position
+        total = max(self.timeline.total(), position)
+        self.query_one("#progress", ProgressBar).update(total=total, progress=position)
+        # ≈ marks times that include estimates for paragraphs not generated yet.
+        approx = "" if self.timeline.exact() else "≈ "
+        timeline = f"{approx}{timestamp(position)} / {approx}{timestamp(total)}"
         if self.preparing:
-            timeline = (
-                f"{timestamp(position)} / {timestamp(self.duration)} buffered · receiving audio"
-            )
+            ahead = max(0.0, self.duration - position)
+            timeline += f"    ·    {timestamp(ahead)} buffered ahead"
         else:
-            timeline = (
-                f"{timestamp(position)} / {timestamp(self.duration)}"
-                f"    ·    {timestamp((self.duration - position) / self.speed)} remaining"
-            )
+            timeline += f"    ·    {timestamp((total - position) / self.speed)} remaining"
         self.query_one("#timeline", Static).update(timeline)
         self.query_one("#play", Button).label = (
             "Replay" if self.ended else "Play" if self.paused else "Pause"
@@ -412,6 +544,24 @@ class ReaderApp(App):
         self.update_reading()
         self.update_playback_status(buffering=ended and self.preparing)
         await self.checkpoint()
+
+    async def player_status(self) -> tuple[float, bool, bool]:
+        position, paused, ended = await self.player.status()
+        return self.timeline.anchor_time + position, paused, ended
+
+    async def player_seek(self, position: float) -> None:
+        await self.player.seek(max(0.0, position - self.timeline.anchor_time))
+
+    async def seek_to(self, target: float) -> None:
+        """Seek within the playlist, or restart it where `target` falls."""
+        unit, offset = self.timeline.locate(target)
+        loaded = self.timeline.anchor_time <= target < self.duration
+        # At or past the buffered end, wait at the live edge if streaming gets there soon.
+        live = target >= self.duration and (self.generation_complete or self.near_live_edge(unit))
+        if loaded or live:
+            await self.player_seek(min(target, self.duration - 0.01))
+        else:
+            self.restart_at(unit, offset)
 
     def log_playback(self, position: float, paused: bool, ended: bool) -> None:
         now = time.monotonic()
@@ -447,18 +597,22 @@ class ReaderApp(App):
             return
         if query_player and self.seek_target is None:
             with contextlib.suppress(PlayerError):
-                self.position, self.paused, ended = await self.player.status()
+                self.position, self.paused, ended = await self.player_status()
                 self.ended = self.restored_finished or (ended and not self.preparing)
+        position = self.duration if self.ended else max(0, min(self.position, self.duration))
+        unit, offset = self.position_unit(position)
         bookmark = Bookmark(
             url=self.current_url,
             narration=self.narration_id,
-            position=self.duration if self.ended else max(0, min(self.position, self.duration)),
+            position=position,
             speed=self.speed,
             paused=self.paused,
             completed=self.restored_finished or (self.ended and self.generation_complete),
             model=self.settings.model,
             voice=self.settings.voice,
             configuration=self.startup_configuration,
+            unit=-1 if unit is None else unit,
+            unit_offset=offset,
         )
         self.last_saved_at = time.monotonic()
         try:
@@ -476,10 +630,15 @@ class ReaderApp(App):
         bookmark = self.restoring
         if bookmark is None or not self.ready:
             return
-        if not final and (bookmark.completed or self.duration <= bookmark.position):
+        unit, offset = self.restore_target
+        cue = self.cues.get(self.spans[unit].start)
+        if cue is None and not final:
             return
-        target = max(0, min(bookmark.position, self.duration - 0.01))
-        await self.player.seek(target)
+        target = self.duration if cue is None else cue.time + offset
+        if not final and (bookmark.completed or self.duration <= target):
+            return
+        target = max(self.timeline.anchor_time, min(target, self.duration - 0.01))
+        await self.player_seek(target)
         await self.player.set_paused(bookmark.paused or bookmark.completed)
         self.restoring = None
         self.restored_finished = bookmark.completed
@@ -498,20 +657,29 @@ class ReaderApp(App):
         self.follow_changed()
 
     def receive_cue(self, cue: Cue) -> None:
-        self.cues[cue.start] = cue
+        unit = self.unit_of.get(cue.start)
+        if unit is None:
+            return
+        if not self.window_cued:
+            self.window_cued = True
+            # A fully cached article plays from its start, whatever was asked for.
+            if unit != self.timeline.anchor:
+                self.timeline.set_anchor(unit)
+                self.duration = self.timeline.anchor_time
+        start = self.timeline.anchor_time
+        end = None if cue.end_time is None else start + cue.end_time
+        self.cues[cue.start] = Cue(cue.start, cue.end, start + cue.time, end)
+        if cue.end_time is not None:
+            self.timeline.known[unit] = cue.end_time - cue.time
+        self.streaming_unit = max(self.streaming_unit, unit)
 
     def update_reading(self) -> None:
         text = self.query_one(ArticleText)
         current = None
         if self.ready and not self.restoring:
             # mpv's source position already accounts for pause, speed, and seeks.
-            position = self.duration if self.ended else self.position
-            for index, span in enumerate(text.spans):
-                cue = self.cues.get(span.start)
-                if cue and cue.time <= position + 0.001 and cue.time < self.duration:
-                    current = index
-                elif cue and cue.time > position:
-                    break
+            position = self.duration - 0.001 if self.ended else self.position
+            current = self.position_unit(position)[0]
         text.highlight(current, self.pending_selection)
         self.query_one(ArticleView).follow(current)
 
@@ -575,7 +743,7 @@ class ReaderApp(App):
         )
         if index is None:
             return
-        if not await self.seek_paragraph(index):
+        if not await self.seek_paragraph(index, paused=False):
             return
         try:
             await self.player.set_paused(False)
@@ -584,8 +752,8 @@ class ReaderApp(App):
             self.set_status(str(exc), error=True)
         self.resume_following()
 
-    async def seek_paragraph(self, index: int) -> bool:
-        """Seek now if the paragraph is buffered, otherwise queue it; True if it seeked."""
+    async def seek_paragraph(self, index: int, *, paused: bool | None = None) -> bool:
+        """Seek to a paragraph, or restart there; False if waiting for it to stream."""
         if not self.ready and not self.preparing:
             return False
         text = self.query_one(ArticleText)
@@ -593,30 +761,36 @@ class ReaderApp(App):
             return False
         self.cancel_queued_seek()
         self.restoring = None
-        self.pending_selection = index
+        self.pending_selection, self.pending_offset = index, 0.0
         seeked = await self.apply_pending_seek()
-        if self.pending_selection is not None and not self.preparing:
+        if self.pending_selection is not None and not self.near_live_edge(index):
             self.pending_selection = None
-            self.set_status(
-                "This paragraph has no buffered audio. Press Read to retry.", error=True
-            )
-        else:
-            self.update_playback_status()
+            self.restart_at(index, paused=paused)
+            seeked = True
+        self.update_playback_status()
         self.update_reading()
         return seeked
 
-    async def apply_pending_seek(self) -> bool:
+    async def apply_pending_seek(self, *, final: bool = False) -> bool:
         if self.pending_selection is None or not self.ready:
             return False
-        span = self.query_one(ArticleText).spans[self.pending_selection]
+        span = self.spans[self.pending_selection]
         cue = self.cues.get(span.start)
         if cue is None or cue.time >= self.duration:
             return False
-        self.pending_selection = None
+        target = cue.time + self.pending_offset
+        # An offset into the unit waits for its audio, unless the unit is already complete.
+        if target >= self.duration and cue.end_time is None and not final:
+            return False
+        target = min(target, (cue.end_time or self.duration) - 0.01, self.duration - 0.01)
+        self.pending_selection, self.pending_offset = None, 0.0
         try:
             self.restored_finished = False
-            await self.player.seek(cue.time)
-            self.position = cue.time
+            await self.player_seek(target)
+            if self.unpause_after_seek:
+                self.unpause_after_seek = False
+                await self.player.set_paused(False)
+            self.position = target
             self.ended = False
             await self.refresh_playback()
             await self.checkpoint(force=True)
@@ -636,6 +810,9 @@ class ReaderApp(App):
             _, paused, ended = await self.player.status()
             replay = self.restored_finished or (ended and not self.preparing)
             self.restored_finished = False
+            if replay and self.timeline.anchor:
+                self.restart_at(0, paused=False)
+                return
             if replay:
                 await self.player.seek(0)
             await self.player.set_paused(False if replay else not paused)
@@ -655,14 +832,15 @@ class ReaderApp(App):
             position = self.seek_target
         else:
             try:
-                position, _, ended = await self.player.status()
+                position, _, ended = await self.player_status()
             except PlayerError as exc:
                 self.set_ready(False)
                 self.set_status(str(exc), error=True)
                 return
             if ended or self.restored_finished:
                 position = self.duration
-        await self.queue_seek(max(0.0, min(self.duration - 0.01, position + offset)))
+        end = self.duration if self.generation_complete else self.timeline.total()
+        await self.queue_seek(max(0.0, min(end - 0.01, position + offset)))
 
     async def queue_seek(self, target: float) -> None:
         """Show the target at once, but seek mpv only after SEEK_DEBOUNCE without more seeks."""
@@ -690,7 +868,7 @@ class ReaderApp(App):
             self.seek_target = None
             return
         try:
-            await self.player.seek(target)
+            await self.seek_to(target)
         except PlayerError as exc:
             self.seek_target = None
             self.set_ready(False)

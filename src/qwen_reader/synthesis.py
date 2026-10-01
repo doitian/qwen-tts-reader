@@ -20,7 +20,7 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .config import Settings
-from .narration import Cue, narration_spans
+from .narration import Cue, TextSpan, narration_spans
 
 SAMPLE_RATE = 24000
 BYTES_PER_SECOND = SAMPLE_RATE * 2  # signed 16-bit mono PCM
@@ -127,6 +127,16 @@ class Synthesizer:
         digest = hashlib.sha256(identity.encode()).hexdigest()
         return self.settings.cache_dir / f"{kind}-{digest}.wav"
 
+    def known_durations(self, text: str) -> dict[int, float]:
+        """Durations of already cached reading units, read from WAV headers only."""
+        known = {}
+        for index, span in enumerate(narration_spans(text, self.settings.chunk_chars)):
+            path = self.cache_path(text[span.start : span.end], "chunk")
+            with contextlib.suppress(OSError, EOFError, wave.Error), wave.open(str(path)) as audio:
+                if audio.getnframes():
+                    known[index] = audio.getnframes() / audio.getframerate()
+        return known
+
     async def synthesize(self, text: str, progress: Callable[[int, int, str], None]) -> Path:
         """Convenience API for callers that want the completed, cached article."""
         self.settings.validate_tts()
@@ -164,6 +174,20 @@ class Synthesizer:
         except (OSError, ValueError, TypeError, KeyError):
             return None
 
+    @staticmethod
+    def join_chunks(spans: list[TextSpan], paths: list[Path], destination: Path) -> list[Cue]:
+        """Publish the full article once every paragraph is cached; [] if any is missing."""
+        if not all(valid_wav(path) for path in paths):
+            return []
+        cues = []
+        elapsed = 0.0
+        for span, path in zip(spans, paths, strict=True):
+            duration = wav_duration(path)
+            cues.append(Cue(span.start, span.end, elapsed, elapsed + duration))
+            elapsed += duration
+        join_wavs(paths, destination)
+        return cues
+
     def save_cues(self, path: Path, cues: list[Cue]) -> None:
         with tempfile.NamedTemporaryFile(
             mode="w", dir=path.parent, suffix=".partial", delete=False
@@ -181,8 +205,15 @@ class Synthesizer:
         progress: Callable[[int, int, str], None],
         spool_dir: Path,
         on_cue: Callable[[Cue], None] | None = None,
+        *,
+        first: int = 0,
+        room: Callable[[], bool] | None = None,
     ) -> AsyncIterator[AudioPart]:
-        """Stream paragraphs in order, with one paragraph of bounded lookahead.
+        """Stream paragraphs in order from `first`, with one paragraph of bounded lookahead.
+
+        Earlier paragraphs are never requested. A new request starts only while
+        `room()` allows more buffered audio; a started request always finishes.
+        Cue times count from `first`, or from 0 when the whole article is cached.
 
         Qwen may merge sentence events, so each request is one reading unit.
         Actual PCM durations provide exact boundaries without estimating speech
@@ -228,13 +259,26 @@ class Synthesizer:
                 queues[index] = asyncio.Queue(maxsize=2)
                 tasks[index] = asyncio.create_task(produce(index, queues[index]))
 
-        paths = []
-        cues = []
+        def has_room(index: int) -> bool:
+            # Cached units cost no request, so they never wait for room.
+            if room is None or index >= len(spans):
+                return True
+            cached = self.cache_path(text[spans[index].start : spans[index].end], "chunk")
+            return cached.exists() or room()
+
+        first = max(0, min(first, len(spans) - 1))
         elapsed = 0.0
-        start(0)
-        start(1)
+        start(first)
+        if has_room(first + 1):
+            start(first + 1)
         try:
-            for index, span in enumerate(spans):
+            for index in range(first, len(spans)):
+                span = spans[index]
+                if index not in tasks:
+                    # Room follows the continuously moving playback position; poll it.
+                    while not has_room(index):  # noqa: ASYNC110
+                        await asyncio.sleep(0.25)
+                    start(index)
                 progress(
                     index, len(spans), f"Receiving speech · paragraph {index + 1} of {len(spans)}"
                 )
@@ -253,16 +297,20 @@ class Synthesizer:
                     elapsed += part.duration
                     yield part
                 cue = Cue(span.start, span.end, cue.time, elapsed)
-                cues.append(cue)
                 if on_cue:
                     on_cue(cue)
-                paths.append(self.cache_path(text[span.start : span.end], "chunk"))
                 await tasks.pop(index)
                 del queues[index]
-                start(index + 2)
+                # Fill the lookahead in order, so a later paragraph never jumps the queue.
+                for ahead in (index + 1, index + 2):
+                    if ahead not in tasks and not has_room(ahead):
+                        break
+                    start(ahead)
                 progress(index + 1, len(spans), f"Prepared {index + 1} of {len(spans)} paragraphs")
-            await asyncio.to_thread(join_wavs, paths, destination)
-            self.save_cues(destination, cues)
+            # Paragraphs may have been cached across sessions and in any order.
+            paths = [self.cache_path(text[span.start : span.end], "chunk") for span in spans]
+            if cues := await asyncio.to_thread(self.join_chunks, spans, paths, destination):
+                self.save_cues(destination, cues)
         finally:
             for task in tasks.values():
                 task.cancel()
@@ -308,13 +356,16 @@ class Synthesizer:
                         output.writeframesraw(pcm)
                         pending.extend(pcm)
                         target = int(BYTES_PER_SECOND * (0.75 if part_number == 0 else 2))
-                        while len(pending) >= target:
+                        # Later cuts keep half a second back, so a paragraph never ends in a
+                        # sliver that mpv skips past; the first cut keeps playback starting fast.
+                        tail = 0 if part_number == 0 else BYTES_PER_SECOND // 2
+                        while len(pending) >= target + tail:
                             segment = spool_dir / f"paragraph-{index:06}-{part_number:06}.wav"
                             write_pcm_wav(segment, bytes(pending[:target]))
                             del pending[:target]
                             part_number += 1
                             yield AudioPart(segment, target / BYTES_PER_SECOND)
-                            target = BYTES_PER_SECOND * 2
+                            target, tail = BYTES_PER_SECOND * 2, BYTES_PER_SECOND // 2
                 if not total or total % 2:
                     raise ValueError("TTS returned empty or incomplete PCM audio frames.")
             wav_duration(temporary)

@@ -142,3 +142,25 @@ async def test_position_is_continuous_across_gapless_part_transitions(tmp_path, 
         assert max(drift) - min(drift) < 0.15
     finally:
         await player.close()
+
+
+@pytest.mark.skipif(not find_mpv(), reason="mpv is not installed")
+async def test_seek_into_a_part_shorter_than_mpvs_audio_buffer(tmp_path, wav_bytes):
+    durations = [1, 0.01, 0.1, 1]
+    paths = [tmp_path / f"part-{i}.wav" for i in range(len(durations))]
+    for path, duration in zip(paths, durations, strict=True):
+        path.write_bytes(wav_bytes(duration))
+    player = MpvPlayer(audio_output="null")
+    try:
+        await player.start()
+        await player.load(paths[0], 1, paused=True)
+        for path, duration in zip(paths[1:], durations[1:], strict=True):
+            await player.append(path, duration)
+        # mpv makes the next file current as soon as it decodes a tiny one, even paused.
+        for target in (1.005, 1.05, 0.5, 1.2):
+            await player.seek(target)
+            position, paused, ended = await player.status()
+            assert position == pytest.approx(target, abs=0.12)
+            assert paused and not ended
+    finally:
+        await player.close()

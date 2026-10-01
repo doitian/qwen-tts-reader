@@ -146,3 +146,48 @@ async def test_duplicate_adjacent_paragraphs_share_one_inflight_request(
         path = await synth.synthesize("Same.\n\nSame.", lambda *args: None)
         assert wav_duration(path) == 4
         assert len(requests) == 1
+
+
+async def test_stream_starts_at_a_paragraph_and_requests_only_while_there_is_room(
+    tmp_path, tts_endpoint, sse_audio
+):
+    text = "One.\n\nTwo.\n\nThree.\n\nFour."
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content)["input"]["text"])
+        return sse_audio(duration=1)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        synth = Synthesizer(
+            Settings(api_key="key", endpoint=tts_endpoint, cache_dir=tmp_path / "cache"), client
+        )
+        room = asyncio.Event()
+        cues = []
+        stream = synth.stream(
+            text, lambda *args: None, tmp_path / "spool", cues.append, first=1, room=room.is_set
+        )
+        async with contextlib.aclosing(stream):
+            parts = [await anext(stream)]
+            await asyncio.sleep(0.6)
+            # Earlier paragraphs are never requested; without room nothing new starts.
+            assert requests == ["Two."]
+            room.set()
+            parts += [part async for part in stream]
+        assert requests == ["Two.", "Three.", "Four."]
+        assert sum(part.duration for part in parts) == 3
+        assert cues[0] == Cue(6, 10, 0)  # Cue times count from the first streamed paragraph.
+        assert synth.known_durations(text) == {1: 1.0, 2: 1.0, 3: 1.0}
+        # Not every paragraph is cached yet, so there is no full article.
+        assert not synth.cache_path(text, "article").exists()
+
+        # Cached paragraphs ignore room; the remaining one completes the full article.
+        requests.clear()
+        never = lambda: False  # noqa: E731
+        stream = synth.stream(text, lambda *args: None, tmp_path / "spool", first=0, room=never)
+        async with contextlib.aclosing(stream):
+            parts = [part async for part in stream]
+        assert requests == ["One."]
+        assert sum(part.duration for part in parts) == 4
+        assert wav_duration(synth.cache_path(text, "article")) == 4
+        assert synth.cached_cues(synth.cache_path(text, "article"), text)[1] == Cue(6, 10, 1, 2)
