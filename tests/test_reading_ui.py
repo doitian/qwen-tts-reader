@@ -308,3 +308,45 @@ async def test_text_cannot_seek_to_stale_audio_after_model_change(tmp_path):
         await pilot.pause()
         assert text.current is None
         assert app.player.position == 0
+
+
+async def test_paragraph_keys_reveal_their_target_without_resuming_follow(
+    tmp_path, tts_endpoint, sse_audio
+):
+    paragraphs = [f"Paragraph {i} reads aloud. " * 6 for i in range(30)]
+    body = "---\ntitle: Opening\n---\n" + "\n\n".join(paragraphs)
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, text=body)
+        return sse_audio(duration=2)
+
+    app = ReaderApp(
+        Settings(api_key="key", endpoint=tts_endpoint, cache_dir=tmp_path),
+        "https://example.test",
+        player=FakePlayer(),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app.prepare_worker.wait()
+        await pilot.pause()
+        text = app.query_one(ArticleText)
+        view = app.query_one(ArticleView)
+        view.focus()
+        await pilot.press("home")
+        await pilot.pause()
+        assert not view.following
+        for _ in range(12):
+            await pilot.press("j")
+        await pilot.pause(0.3)
+        assert text.current == 12
+        region = text.reading_region(12)
+        assert view.scroll_y <= region.y and region.bottom <= view.scroll_y + view.size.height
+        assert not view.following
+        await pilot.press("end")
+        await pilot.pause()
+        await pilot.press("k")
+        await pilot.pause(0.3)
+        region = text.reading_region(11)
+        assert view.scroll_y <= region.y < view.scroll_y + view.size.height
+        assert not view.following

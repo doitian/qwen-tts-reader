@@ -144,7 +144,12 @@ class ArticleView(VerticalScroll):
         self.set_following(False)
 
     def follow(self, index: int | None) -> None:
-        if not self.following or index is None:
+        if self.following:
+            self.reveal(index)
+
+    def reveal(self, index: int | None) -> None:
+        """Scroll a reading unit into view without changing whether the view follows."""
+        if index is None:
             return
         region = self.query_one(ArticleText).reading_region(index)
         if region is not None:

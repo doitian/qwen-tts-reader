@@ -721,6 +721,8 @@ class ReaderApp(App):
         index = max(0, min(len(text.spans) - 1, base + delta))
         if delta > 0 and index == base:
             return
+        # Show the chosen paragraph even while browsing without following.
+        self.query_one(ArticleView).reveal(index)
         cue = self.cues.get(text.spans[index].start)
         if self.ready and cue is not None and cue.time < self.duration:
             self.restoring = None

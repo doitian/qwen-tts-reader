@@ -37,7 +37,7 @@ Bookmarks live in `playback.json` inside `QWEN_READER_CACHE_DIR`. They contain a
 | --- | --- |
 | Space / Play button | Play, pause, or replay after the end |
 | ← / → or H / L | Rewind / fast-forward 10 seconds |
-| J / K | Seek to the next / previous paragraph |
+| J / K | Seek to the next / previous paragraph and scroll it into view, even while not following |
 | − / + (or =) | Adjust speed by 0.1×, from 0.5× to 3.0× |
 | Click article text | Seek to the start of that paragraph |
 | Ctrl+click a link | Open its `http`/`https` URL in your browser |
