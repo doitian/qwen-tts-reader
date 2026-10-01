@@ -22,7 +22,7 @@ from textual.css.query import NoMatches
 from textual.widgets import Button, Footer, Header, Input, ProgressBar, Static
 from textual.worker import Worker, WorkerCancelled, WorkerFailed
 
-from .article import fetch_article, normalize_url
+from .article import is_web, load_article, normalize_source
 from .article_view import ArticleText, ArticleView
 from .config import MODEL_VOICES, Settings
 from .model_screen import ModelScreen
@@ -166,6 +166,7 @@ class ReaderApp(App):
         player: MpvPlayer | None = None,
         client: httpx.AsyncClient | None = None,
         restore_choices: bool = True,
+        stdin: str | None = None,
     ):
         super().__init__()
         self.playback_state = PlaybackState(settings.cache_dir / "playback.json")
@@ -193,6 +194,7 @@ class ReaderApp(App):
             settings = replace(settings, model=last.model, voice=last.voice)
         self.settings = settings
         self.initial_url = url or self.playback_state.last_url
+        self.stdin = stdin
         self.player = player or MpvPlayer()
         self.client = client or httpx.AsyncClient(follow_redirects=True, timeout=60)
         self.synthesizer = Synthesizer(settings, self.client)
@@ -315,7 +317,9 @@ class ReaderApp(App):
         yield Header()
         with Vertical(id="main"):
             with Horizontal(id="url-row"):
-                yield Input(self.initial_url, placeholder="Paste an article URL…", id="url")
+                yield Input(
+                    self.initial_url, placeholder="Paste an article URL or Markdown file…", id="url"
+                )
                 yield Button("Read", variant="primary", id="load")
                 yield Button("Model", id="choose-model")
             yield Static("An article, at your pace.", id="article-title", markup=False)
@@ -324,7 +328,7 @@ class ReaderApp(App):
             )
             with ArticleView(id="article-view"):
                 yield ArticleText(
-                    "Paste a public article URL and press Enter.\n\n"
+                    "Paste a public article URL or a Markdown file path and press Enter.\n\n"
                     "The article will appear here while its narration is prepared.\n"
                     "Playback starts as audio arrives; the rest streams in the background.",
                     id="article-text",
@@ -385,7 +389,7 @@ class ReaderApp(App):
         if self.closing:
             return
         try:
-            url = normalize_url(self.query_one("#url", Input).value)
+            url = normalize_source(self.query_one("#url", Input).value)
         except ValueError as exc:
             self.set_status(str(exc), error=True)
             return
@@ -408,11 +412,13 @@ class ReaderApp(App):
         self.query_one("#timeline", Static).update("00:00 / 00:00")
         self.query_one("#play", Button).label = "Play"
         self.query_one("#progress", ProgressBar).update(total=None)
-        self.set_status("Fetching article with Defuddle… · Esc to cancel")
+        self.set_status(
+            "Fetching article with Defuddle… · Esc to cancel" if is_web(url) else "Reading article…"
+        )
         try:
             async with self.mpv_lock:
                 await self.close_window()
-            article = await fetch_article(self.client, url, self.settings.defuddle_key)
+            article = await load_article(self.client, url, self.settings.defuddle_key, self.stdin)
             self.query_one("#article-title", Static).update(article.title)
             self.query_one("#article-meta", Static).update(
                 " · ".join(

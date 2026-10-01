@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from html import unescape
+from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urldefrag, urlsplit
 
@@ -37,6 +38,26 @@ def normalize_url(value: str) -> str:
     if url.username or url.password:
         raise ValueError("Use a public article URL without embedded credentials.")
     return urldefrag(value)[0]
+
+
+STDIN = "-"
+# Never the start of a scheme-less URL, so a missing file is reported as one.
+LOCAL_PATH = re.compile(r"[/\\~.]|[A-Za-z]:[/\\]")
+
+
+def is_web(source: str) -> bool:
+    return source.startswith(("http://", "https://"))
+
+
+def normalize_source(value: str) -> str:
+    """An article URL, the absolute path of a local Markdown file, or STDIN."""
+    value = value.strip()
+    if value == STDIN:
+        return value
+    path = Path(value).expanduser()
+    if "://" not in value and (LOCAL_PATH.match(value) or path.is_file()):
+        return str(path.resolve())
+    return normalize_url(value)
 
 
 MARKS = {"strong": "strong", "em": "em", "s": "strike", "link": "link"}
@@ -118,25 +139,33 @@ def speech_text(markdown: str) -> str:
     return "\n\n".join(blocks)
 
 
-def parse_article(url: str, body: str) -> Article:
+def parse_article(url: str, body: str, fallback_title: str = "") -> Article:
     metadata = {}
     match = re.match(r"\A\ufeff?---\s*\n(.*?)\n---\s*(?:\n|$)", body, re.DOTALL)
     if match:
         try:
             loaded = yaml.safe_load(match.group(1))
         except yaml.YAMLError as exc:
-            raise ValueError("Defuddle returned invalid article metadata.") from exc
+            source = "Defuddle returned" if is_web(url) else "The Markdown has"
+            raise ValueError(f"{source} invalid article metadata.") from exc
         if isinstance(loaded, dict):
             metadata = loaded
         body = body[match.end() :]
-    title = str(metadata.get("title") or urlsplit(url).hostname or "Article")
+    title = str(metadata.get("title") or "")
     author = str(metadata.get("author") or "")
     text = speech_text(body)
     if not text:
-        raise ValueError("No readable article text found. Try another public article URL.")
+        hint = " Try another public article URL." if is_web(url) else ""
+        raise ValueError("No readable article text found." + hint)
     # Defuddle generally removes the title from its body; speak it exactly once.
-    if text.split("\n", 1)[0].casefold() != title.casefold():
+    if title and text.split("\n", 1)[0].casefold() != title.casefold():
         text = title + ".\n\n" + text
+    if not title:
+        # A leading heading is already spoken; fallback titles are only shown.
+        tokens = markdown_parser().parse(body)
+        if len(tokens) > 1 and tokens[0].type == "heading_open":
+            title = "".join(run.text for run in inline_runs(tokens[1].children or []))
+        title = title or fallback_title or urlsplit(url).hostname or "Article"
     return Article(url, title, author, body.strip(), text)
 
 
@@ -153,6 +182,26 @@ async def fetch_article(client: httpx.AsyncClient, url: str, api_key: str = "") 
     if "text/html" in response.headers.get("content-type", ""):
         raise ValueError("Defuddle returned an HTML page instead of an article. Try another URL.")
     return parse_article(url, response.text)
+
+
+async def load_article(
+    client: httpx.AsyncClient, source: str, api_key: str = "", stdin: str | None = None
+) -> Article:
+    """Fetch a URL through Defuddle, or read a local file or standard input as Markdown."""
+    if is_web(source):
+        return await fetch_article(client, source, api_key)
+    if source == STDIN:
+        if stdin is None:
+            raise ValueError("Nothing was piped in. Run `qwen-reader -` to read standard input.")
+        return parse_article(source, stdin, "Standard input")
+    path = Path(source)
+    try:
+        body = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{path} isn't UTF-8 text.") from exc
+    except OSError as exc:
+        raise ValueError(f"Can't read {path}: {exc.strerror or exc}.") from exc
+    return parse_article(source, body, path.stem)
 
 
 def split_text(text: str, limit: int = 1800) -> list[str]:

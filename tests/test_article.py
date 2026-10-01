@@ -3,7 +3,16 @@ import re
 import httpx
 import pytest
 
-from qwen_reader.article import fetch_article, normalize_url, parse_article, speech_text, split_text
+from qwen_reader.article import (
+    STDIN,
+    fetch_article,
+    load_article,
+    normalize_source,
+    normalize_url,
+    parse_article,
+    speech_text,
+    split_text,
+)
 
 
 @pytest.mark.parametrize(
@@ -115,3 +124,61 @@ async def test_defuddle_failures_are_actionable(status, headers, body, expected)
     ) as client:
         with pytest.raises(ValueError, match=expected):
             await fetch_article(client, "https://example.com")
+
+
+def test_sources_are_urls_local_files_or_stdin(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "notes.md").write_text("Notes.")
+    (tmp_path / "example.com").write_text("A file that looks like a host.")
+    assert normalize_source(" - ") == STDIN
+    assert normalize_source("notes.md") == str(tmp_path.resolve() / "notes.md")
+    assert normalize_source("example.com") == str(tmp_path.resolve() / "example.com")
+    assert normalize_source("example.org/story") == "https://example.org/story"
+    # Paths are recognized before the file exists, so a typo isn't sent to Defuddle.
+    assert normalize_source("./missing.md") == str(tmp_path.resolve() / "missing.md")
+    assert normalize_source(str(tmp_path / "missing.md")) == str(tmp_path.resolve() / "missing.md")
+    for source in ["-", "notes.md", "./missing.md", "example.org/story"]:
+        assert normalize_source(normalize_source(source)) == normalize_source(source)
+    with pytest.raises(ValueError):
+        normalize_source("file:///etc/passwd")
+
+
+async def test_local_markdown_and_stdin_skip_defuddle(tmp_path):
+    def handler(request):
+        pytest.fail("Local Markdown must not be sent anywhere")
+
+    heading = tmp_path / "heading.md"
+    heading.write_bytes("﻿# My **notes**\r\n\r\nFirst point.\r\n".encode())
+    plain = tmp_path / "plain.md"
+    plain.write_text("Just text.", encoding="utf-8")
+    titled = tmp_path / "titled.md"
+    titled.write_text("---\ntitle: Front matter\nauthor: Me\n---\nBody.", encoding="utf-8")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        article = await load_article(client, str(heading))
+        assert (article.title, article.text) == ("My notes", "My notes\n\nFirst point.")
+        # A file name or "Standard input" is shown, never spoken.
+        article = await load_article(client, str(plain))
+        assert (article.title, article.text) == ("plain", "Just text.")
+        article = await load_article(client, str(titled))
+        assert (article.title, article.author) == ("Front matter", "Me")
+        assert article.text == "Front matter.\n\nBody."
+        article = await load_article(client, STDIN, stdin="Piped *text*.")
+        assert (article.url, article.title, article.text) == (
+            STDIN,
+            "Standard input",
+            "Piped text.",
+        )
+
+
+async def test_unreadable_local_sources_are_reported(tmp_path):
+    binary = tmp_path / "binary.md"
+    binary.write_bytes(b"\xff\xfe\x00bad")
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(ValueError, match="Can't read .*missing.md"):
+            await load_article(client, str(tmp_path / "missing.md"))
+        with pytest.raises(ValueError, match="isn't UTF-8"):
+            await load_article(client, str(binary))
+        with pytest.raises(ValueError, match="Nothing was piped in"):
+            await load_article(client, STDIN)
+        with pytest.raises(ValueError, match="No readable article text found.$"):
+            await load_article(client, STDIN, stdin="![image](image.png)")

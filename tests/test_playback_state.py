@@ -10,7 +10,7 @@ from test_streaming import STOP, ByteStream, pcm_event
 from textual.widgets import Input, Select
 
 from qwen_reader.app import ReaderApp, Stage
-from qwen_reader.article import parse_article
+from qwen_reader.article import STDIN, parse_article
 from qwen_reader.article_view import ArticleText
 from qwen_reader.config import MODEL, Settings
 from qwen_reader.model_screen import CUSTOM_VOICE
@@ -132,6 +132,43 @@ async def test_periodic_save_and_switching_articles_do_not_mix_positions(
         await streamed(app, pilot)
         assert app.player.position == 17
         assert app.playback_state.get("https://two.test", narration).position == 22
+
+
+async def test_local_file_reopens_at_startup_and_piped_text_resumes(
+    tmp_path, tts_endpoint, sse_audio
+):
+    settings = Settings(api_key="key", endpoint=tts_endpoint, cache_dir=tmp_path / "cache")
+    notes = tmp_path / "notes.md"
+    notes.write_text("# Notes\n\nA local story.", encoding="utf-8")
+
+    async def play(app, position):
+        async with app.run_test() as pilot:
+            await streamed(app, pilot)
+            restored = app.player.position
+            app.player.position = position
+            await until(pilot, lambda: app.heard == position)
+            app.action_quit()
+            await pilot.pause()
+        return restored
+
+    def reader(url="", stdin=None):
+        return ReaderApp(
+            settings, url, player=FakePlayer(), client=mock_services(sse_audio), stdin=stdin
+        )
+
+    app = reader(str(notes))
+    await play(app, 7)
+    assert (app.current_url, app.article_title) == (str(notes.resolve()), "Notes")
+    piped = reader(STDIN, "Piped story.")
+    await play(piped, 4)
+    state = PlaybackState(tmp_path / "cache" / "playback.json")
+    assert state.get(STDIN, piped.narration_id).position == 4
+    # Piped text can't be read again, so startup reopens the file instead.
+    assert state.last_url == str(notes.resolve())
+    restarted = reader()
+    assert await play(restarted, 9) == 7
+    assert restarted.current_url == str(notes.resolve())
+    assert await play(reader(STDIN, "Piped story."), 5) == 4
 
 
 async def test_restore_waits_silently_for_target_without_overwriting_bookmark(

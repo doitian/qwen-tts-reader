@@ -1,6 +1,6 @@
 # Qwen article reader
 
-A Python / Textual TUI that extracts articles through [Defuddle](https://defuddle.md/docs#api-use), streams narration from Qwen Audio, and plays it through mpv. The default model is `qwen-audio-3.1-tts-flash`.
+A Python / Textual TUI that extracts articles through [Defuddle](https://defuddle.md/docs#api-use) or reads local Markdown, streams narration from Qwen Audio, and plays it through mpv. The default model is `qwen-audio-3.1-tts-flash`.
 
 ## Run
 
@@ -13,6 +13,9 @@ cp .env.example .env
 uv run qwen-reader
 # Or start reading a URL directly:
 uv run qwen-reader 'https://stephango.com/saw'
+# Or a Markdown file, or Markdown piped to standard input:
+uv run qwen-reader notes.md
+cat notes.md | uv run qwen-reader -
 ```
 
 You can also install with `pip install -e .` and run `qwen-reader`. The app reads `.env`; existing environment variables take precedence. Never commit your key.
@@ -27,11 +30,13 @@ QWEN_TTS_MODEL=qwen-audio-3.1-tts-flash
 
 There is no default endpoint or legacy DashScope fallback. If you used the earlier POC configuration, replace `DASHSCOPE_API_KEY` with `QWEN_TTS_API_KEY` and set the full endpoint instead of `DASHSCOPE_WORKSPACE_ID`. Restart the reader after changing configuration.
 
-Paste a URL, then press **Enter** or click **Read**. Playback starts after roughly 0.75 seconds of audio has arrived. Speech is generated on demand: from the current paragraph onward, in order, and only about three minutes of listening time ahead of playback (more at higher speeds), so a long article is never generated all at once. Paragraphs before the one you start or jump to are not generated, but paragraphs already cached are reused. Until every paragraph's length is known, the timeline and progress bar show the whole article with estimated times marked **≈**, plus how much audio is buffered ahead. Press **Esc** to cancel generation and playback, or load another URL to replace the article. Completed requests remain cached for retries.
+Paste a URL or a Markdown file path, then press **Enter** or click **Read**. Playback starts after roughly 0.75 seconds of audio has arrived. Speech is generated on demand: from the current paragraph onward, in order, and only about three minutes of listening time ahead of playback (more at higher speeds), so a long article is never generated all at once. Paragraphs before the one you start or jump to are not generated, but paragraphs already cached are reused. Until every paragraph's length is known, the timeline and progress bar show the whole article with estimated times marked **≈**, plus how much audio is buffered ahead. Press **Esc** to cancel generation and playback, or load another URL to replace the article. Completed requests remain cached for retries.
 
-Starting `uv run qwen-reader` without a URL reopens the last article and restores its playback position, speed, and pause state. Progress is saved every two seconds, after playback controls, when switching articles, and on quit. Each article/narration keeps its own position. Bookmarks store the paragraph and the offset into it, so restoring generates only from that paragraph; playback waits silently until the saved position is buffered. A finished article stays at the end, ready to replay with Space.
+A file path or `-` (standard input) is read directly as UTF-8 Markdown instead of through Defuddle. Input counts as a path if the file exists, or if it starts with `/`, `.`, `~`, `\`, or a drive letter; anything else is a URL. The title comes from front matter, then from a leading heading; otherwise the file name is shown but not spoken. Piped text is read once at startup, and the reader then takes its keys from the terminal; enter `-` again to reload it.
 
-Bookmarks live in `playback.json` inside `QWEN_READER_CACHE_DIR`. They contain article URLs, playback settings, and the model and voice chosen in the TUI, but no API keys or article text. Delete that file to clear saved progress. Run `uv run qwen-reader purge-cache` to delete cached speech (paragraph and full-article audio) while keeping bookmarks, or add `--all` to also delete `playback.json`. It only removes files the reader created, and skips audio a running reader is still playing. Changed article text, model, voice, or endpoint gets a separate bookmark because the audio timeline can differ.
+Starting `uv run qwen-reader` without a URL reopens the last article or file and restores its playback position, speed, and pause state. Progress is saved every two seconds, after playback controls, when switching articles, and on quit. Each article/narration keeps its own position. Bookmarks store the paragraph and the offset into it, so restoring generates only from that paragraph; playback waits silently until the saved position is buffered. A finished article stays at the end, ready to replay with Space. Piped text is never reopened at startup, but piping the same text again resumes it.
+
+Bookmarks live in `playback.json` inside `QWEN_READER_CACHE_DIR`. They contain article URLs and file paths, playback settings, and the model and voice chosen in the TUI, but no API keys or article text. Delete that file to clear saved progress. Run `uv run qwen-reader purge-cache` to delete cached speech (paragraph and full-article audio) while keeping bookmarks, or add `--all` to also delete `playback.json`. It only removes files the reader created, and skips audio a running reader is still playing. Changed article text, model, voice, or endpoint gets a separate bookmark because the audio timeline can differ.
 
 | Control | Action |
 | --- | --- |
@@ -101,7 +106,7 @@ An explicitly configured HTTPS `/api/v1/services/audio/tts/SpeechSynthesizer` en
 
 ## POC behavior and limits
 
-- The URL is sent to Defuddle; extracted prose is sent to Alibaba Cloud for synthesis. Standard service usage charges and rate limits apply.
+- A URL is sent to Defuddle; local Markdown never is. Extracted prose is sent to Alibaba Cloud for synthesis. Standard service usage charges and rate limits apply.
 - Markdown link labels and inline code are spoken; formatting, images, and fenced code blocks are skipped. No summarization is performed.
 - Each paragraph is a separate streamed request, with a limit of 1,800 characters per request. One paragraph is prefetched ahead with a bounded queue (at most two requests in flight), and audio always plays in article order. Each request's initial 0.75-second segment is followed by two-second segments queued in mpv's playlist. Delivery may vary at paragraph boundaries. Network stalls or playback faster than generation can cause buffering.
 - Completed text requests are cached and assembled into a full WAV for instant subsequent playback. An interrupted request is never cached as complete; already received audio remains playable with the error shown. Temporary playback segments are deleted when the article is replaced or the app exits.

@@ -8,7 +8,7 @@ import tempfile
 from dataclasses import asdict, astuple, dataclass
 from pathlib import Path
 
-from .article import normalize_url
+from .article import STDIN, normalize_source
 
 
 @dataclass(frozen=True)
@@ -53,7 +53,7 @@ class PlaybackState:
                 try:
                     bookmark = Bookmark(**entry)
                     if (
-                        normalize_url(bookmark.url) != bookmark.url
+                        normalize_source(bookmark.url) != bookmark.url
                         or not isinstance(bookmark.narration, str)
                         or not bookmark.narration
                         or not math.isfinite(bookmark.position)
@@ -100,8 +100,10 @@ class PlaybackState:
 
     def save(self, bookmark: Bookmark) -> None:
         self.bookmarks[self.key(bookmark.url, bookmark.narration)] = bookmark
-        self.last_url = bookmark.url
-        self.last_narration = bookmark.narration
+        # Piped text can't be read again at startup, but piping it again resumes it.
+        if bookmark.url != STDIN:
+            self.last_url = bookmark.url
+            self.last_narration = bookmark.narration
         self.write()
 
     def save_choice(self, choice: ModelChoice) -> None:

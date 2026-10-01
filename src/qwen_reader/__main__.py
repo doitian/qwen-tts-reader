@@ -10,9 +10,21 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .app import ReaderApp
+from .article import STDIN
 from .config import MODEL, MODEL_VOICES, Settings
 from .player import MpvPlayer
 from .synthesis import purge_cache
+
+
+def read_stdin() -> str:
+    """Read piped Markdown, then give the TUI the terminal as its keyboard."""
+    data = sys.stdin.buffer.read()
+    if not sys.stdin.isatty():
+        # Textual reads keys from file descriptor 0; on Windows dup2 also sets the std handle.
+        terminal = os.open("CONIN$" if os.name == "nt" else "/dev/tty", os.O_RDWR)
+        os.dup2(terminal, 0)
+        os.close(terminal)
+    return data.decode("utf-8-sig")
 
 
 def purge(argv: list[str]) -> None:
@@ -38,11 +50,14 @@ def main() -> None:
         purge(sys.argv[2:])
         return
     parser = argparse.ArgumentParser(
-        description="Read web articles aloud with selectable Qwen Audio TTS models.",
+        description="Read web articles or Markdown aloud with selectable Qwen Audio TTS models.",
         epilog="Run `qwen-reader purge-cache` to delete cached speech (--help for options).",
     )
     parser.add_argument(
-        "url", nargs="?", default="", help="Article URL (defaults to the last article)"
+        "url",
+        nargs="?",
+        default="",
+        help="Article URL, Markdown file, or - for standard input (defaults to the last article)",
     )
     parser.add_argument("--model", choices=MODEL_VOICES, help=f"TTS model (default: {MODEL})")
     parser.add_argument("--voice", help="Voice override (otherwise use the model's default)")
@@ -52,6 +67,14 @@ def main() -> None:
         help="Write a playback timing log here, and mpv's own log beside it (or QWEN_READER_LOG)",
     )
     args = parser.parse_args()
+    stdin = None
+    if args.url.strip() == STDIN:
+        try:
+            stdin = read_stdin()
+        except UnicodeDecodeError:
+            parser.error("standard input isn't UTF-8 text")
+        except OSError as exc:
+            parser.error(f"no terminal for keyboard input after reading standard input: {exc}")
     load_dotenv()
     log_file = args.log or (Path(value) if (value := os.getenv("QWEN_READER_LOG")) else None)
     player = None
@@ -73,7 +96,11 @@ def main() -> None:
     except ValueError as exc:
         parser.error(str(exc))
     ReaderApp(
-        settings, args.url, player=player, restore_choices=not (args.model or args.voice)
+        settings,
+        args.url,
+        player=player,
+        restore_choices=not (args.model or args.voice),
+        stdin=stdin,
     ).run()
 
 
