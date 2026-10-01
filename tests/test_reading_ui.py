@@ -7,7 +7,7 @@ from test_app import FakePlayer
 from test_streaming import STOP, ByteStream, pcm_event
 from textual import events
 from textual.scrollbar import ScrollTo
-from textual.widgets import Button, Static
+from textual.widgets import Button, Input, Static
 
 from qwen_reader.app import ReaderApp
 from qwen_reader.article_view import ArticleText, ArticleView
@@ -116,7 +116,19 @@ async def test_highlight_follow_browse_click_resume_resize_and_cached_replay(
 
 @pytest.mark.parametrize(
     "gesture",
-    ["wheel_up", "wheel_down", "scrollbar", "pagedown", "pageup", "down", "up", "home", "end"],
+    [
+        "wheel_up",
+        "wheel_down",
+        "scrollbar",
+        "pagedown",
+        "pageup",
+        "ctrl+f",
+        "ctrl+b",
+        "down",
+        "up",
+        "home",
+        "end",
+    ],
 )
 async def test_manual_scroll_disables_follow_until_button(gesture, tmp_path):
     app = ReaderApp(Settings(cache_dir=tmp_path), player=FakePlayer(), client=httpx.AsyncClient())
@@ -138,6 +150,77 @@ async def test_manual_scroll_disables_follow_until_button(gesture, tmp_path):
         await pilot.click("#follow")
         await pilot.pause()
         assert view.following
+
+
+async def test_vim_keys_seek_paragraphs_and_time_scroll_and_follow(
+    tmp_path, tts_endpoint, sse_audio
+):
+    paragraphs = [f"Paragraph {i} reads aloud. " * 6 for i in range(30)]
+    body = "---\ntitle: Opening\n---\n" + "\n\n".join(paragraphs)
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, text=body)
+        return sse_audio(duration=2)
+
+    player = FakePlayer()
+    app = ReaderApp(
+        Settings(api_key="key", endpoint=tts_endpoint, cache_dir=tmp_path),
+        "https://example.test",
+        player=player,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app.prepare_worker.wait()
+        await pilot.pause()
+        text = app.query_one(ArticleText)
+        view = app.query_one(ArticleView)
+
+        await pilot.press("j", "j", "j")
+        assert player.position == 6
+        assert text.current == 3
+        await pilot.press("k")
+        assert player.position == 4
+        await pilot.press("l")
+        assert player.position == 14
+        await pilot.press("h")
+        assert player.position == 4
+        await pilot.press("k", "k", "k")
+        assert player.position == 0
+        last = app.duration - 1
+        player.position = last
+        await app.refresh_playback()
+        await pilot.press("j")
+        assert player.position == last  # Already in the last paragraph.
+
+        await pilot.press("ctrl+b")
+        await pilot.pause()
+        assert not view.following
+        browsed = view.scroll_y
+        await pilot.press("f")
+        await pilot.pause()
+        assert view.following
+        assert view.scroll_y > browsed
+
+        # r reads from the first paragraph with any line on screen, even a partial one.
+        target = text.reading_region(10)
+        assert target is not None and target.height > 1
+        view.set_following(False)
+        view.scroll_to(y=target.y + 1, animate=False)
+        player.paused = True
+        await pilot.pause()
+        await pilot.press("r")
+        await pilot.pause()
+        assert player.position == 20
+        assert not player.paused
+        assert text.current == 10
+        assert view.following
+
+        last = player.position
+        app.query_one("#url", Input).focus()
+        await pilot.press("end", "j", "k", "h", "l", "f", "r")
+        assert player.position == last
+        assert app.query_one("#url", Input).value.endswith("jkhlfr")
 
 
 async def test_click_unbuffered_paragraph_waits_then_seeks_without_resuming_follow(

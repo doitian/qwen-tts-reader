@@ -36,11 +36,13 @@ Bookmarks live in `playback.json` inside `QWEN_READER_CACHE_DIR`. They contain a
 | Control | Action |
 | --- | --- |
 | Space / Play button | Play, pause, or replay after the end |
-| ← / → | Rewind / fast-forward 10 seconds |
+| ← / → or H / L | Rewind / fast-forward 10 seconds |
+| J / K | Seek to the next / previous paragraph |
 | − / + (or =) | Adjust speed by 0.1×, from 0.5× to 3.0× |
 | Click article text | Seek to the start of that paragraph |
-| Scroll wheel / ↑ ↓ / Page Up, Page Down / Home, End / scrollbar | Browse freely; stop automatic following |
-| Resume sync button | Bring the current paragraph into view and resume following |
+| R | Read from the first paragraph visible on screen and resume following |
+| Scroll wheel / ↑ ↓ / Page Up, Page Down / Ctrl+F, Ctrl+B / Home, End / scrollbar | Browse freely; stop automatic following |
+| F / Resume sync button | Bring the current paragraph into view and resume following |
 | Ctrl+L | Focus the URL input |
 | Model button / F2 | Choose a model and voice from dropdowns, or enter a custom voice ID |
 | Esc | Cancel preparation / leave URL input |

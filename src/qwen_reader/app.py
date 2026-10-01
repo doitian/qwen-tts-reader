@@ -70,6 +70,15 @@ class ReaderApp(App):
         Binding("right", "seek(10)", "+10s", priority=True),
         Binding("minus", "speed(-0.1)", "Slower", priority=True),
         Binding("plus,equals", "speed(0.1)", "Faster", priority=True),
+        # Letter keys are not priority bindings, so the URL input still receives them.
+        Binding("h", "seek(-10)", "−10s", show=False),
+        Binding("l", "seek(10)", "+10s", show=False),
+        Binding("j", "paragraph(1)", "Next paragraph", show=False),
+        Binding("k", "paragraph(-1)", "Previous paragraph", show=False),
+        Binding("f", "follow", "Follow", show=False),
+        Binding("r", "read_visible", "Read from here", show=False),
+        Binding("ctrl+f", "scroll_page(1)", "Page down", show=False),
+        Binding("ctrl+b", "scroll_page(-1)", "Page up", show=False),
         Binding("ctrl+l", "focus_url", "URL", priority=True),
         Binding("f2", "choose_model", "Model", priority=True),
         Binding("escape", "cancel", "Cancel", priority=True),
@@ -178,7 +187,15 @@ class ReaderApp(App):
             return True
         if isinstance(self.screen, ModelScreen):
             return False
-        if action in {"toggle_pause", "seek", "speed"} and isinstance(self.focused, Input):
+        if action in {
+            "toggle_pause",
+            "seek",
+            "speed",
+            "paragraph",
+            "follow",
+            "scroll_page",
+            "read_visible",
+        } and isinstance(self.focused, Input):
             return False
         return True
 
@@ -488,6 +505,17 @@ class ReaderApp(App):
         button.disabled = following
         button.variant = "primary" if following else "warning"
 
+    def action_scroll_page(self, direction: int) -> None:
+        view = self.query_one(ArticleView)
+        view.set_following(False)
+        if direction > 0:
+            view.scroll_page_down()
+        else:
+            view.scroll_page_up()
+
+    def action_follow(self) -> None:
+        self.resume_following()
+
     @on(Button.Pressed, "#follow")
     def resume_following(self) -> None:
         self.query_one(ArticleView).set_following(True)
@@ -496,14 +524,52 @@ class ReaderApp(App):
 
     @on(ArticleText.Selected)
     async def select_text(self, event: ArticleText.Selected) -> None:
-        if not self.ready and not self.preparing:
-            return
+        await self.seek_paragraph(event.index)
+
+    async def action_paragraph(self, delta: int) -> None:
         text = self.query_one(ArticleText)
-        if not 0 <= event.index < len(text.spans):
+        # Repeated presses move a queued selection that is still waiting for audio.
+        base = self.pending_selection if self.pending_selection is not None else text.current
+        if base is None:
+            base = -1 if delta > 0 else 0
+        index = max(0, min(len(text.spans) - 1, base + delta))
+        if delta > 0 and index == base:
             return
+        await self.seek_paragraph(index)
+
+    async def action_read_visible(self) -> None:
+        view = self.query_one(ArticleView)
+        text = self.query_one(ArticleText)
+        top = view.scroll_y - text.virtual_region.y
+        index = next(
+            (
+                index
+                for index in range(len(text.spans))
+                if (region := text.reading_region(index)) and region.bottom > top
+            ),
+            None,
+        )
+        if index is None:
+            return
+        if not await self.seek_paragraph(index):
+            return
+        try:
+            await self.player.set_paused(False)
+            await self.refresh_playback()
+        except PlayerError as exc:
+            self.set_status(str(exc), error=True)
+        self.resume_following()
+
+    async def seek_paragraph(self, index: int) -> bool:
+        """Seek now if the paragraph is buffered, otherwise queue it; True if it seeked."""
+        if not self.ready and not self.preparing:
+            return False
+        text = self.query_one(ArticleText)
+        if not 0 <= index < len(text.spans):
+            return False
         self.restoring = None
-        self.pending_selection = event.index
-        await self.apply_pending_seek()
+        self.pending_selection = index
+        seeked = await self.apply_pending_seek()
         if self.pending_selection is not None and not self.preparing:
             self.pending_selection = None
             self.set_status(
@@ -512,14 +578,15 @@ class ReaderApp(App):
         else:
             self.update_playback_status()
         self.update_reading()
+        return seeked
 
-    async def apply_pending_seek(self) -> None:
+    async def apply_pending_seek(self) -> bool:
         if self.pending_selection is None or not self.ready:
-            return
+            return False
         span = self.query_one(ArticleText).spans[self.pending_selection]
         cue = self.cues.get(span.start)
         if cue is None or cue.time >= self.duration:
-            return
+            return False
         self.pending_selection = None
         try:
             self.restored_finished = False
@@ -528,8 +595,10 @@ class ReaderApp(App):
             self.ended = False
             await self.refresh_playback()
             await self.checkpoint(force=True)
+            return True
         except PlayerError as exc:
             self.set_status(str(exc), error=True)
+            return False
 
     @on(Button.Pressed, "#play")
     async def action_toggle_pause(self) -> None:
