@@ -5,11 +5,11 @@ from dataclasses import asdict, replace
 
 import httpx
 import pytest
-from test_app import FakePlayer, mock_services
+from test_app import FakePlayer, mock_services, streamed, until
 from test_streaming import STOP, ByteStream, pcm_event
 from textual.widgets import Input, Select
 
-from qwen_reader.app import ReaderApp
+from qwen_reader.app import ReaderApp, Stage
 from qwen_reader.article import parse_article
 from qwen_reader.article_view import ArticleText
 from qwen_reader.config import MODEL, Settings
@@ -73,11 +73,14 @@ async def test_restart_restores_last_url_exact_position_speed_pause_and_highligh
         settings, "https://example.com/story", player=player, client=mock_services(sse_audio)
     )
     async with app.run_test() as pilot:
-        await app.prepare_worker.wait()
-        await app.action_speed(0.5)
-        player.position, player.paused = 37.25, paused
-        # Quit must fetch the final mpv position, even between periodic updates.
-        await app.action_quit()
+        await streamed(app, pilot)
+        app.action_speed(0.5)
+        if paused:
+            app.action_toggle_pause()
+        player.position = 37.25
+        # Quitting saves what the controller last heard, never waiting on mpv.
+        await until(pilot, lambda: app.heard == 37.25 and player.paused == paused)
+        app.action_quit()
         await pilot.pause()
     stored = PlaybackState(tmp_path / "playback.json")
     bookmark = stored.get(app.current_url, app.narration_id)
@@ -88,14 +91,12 @@ async def test_restart_restores_last_url_exact_position_speed_pause_and_highligh
     restarted_player = FakePlayer()
     restarted = ReaderApp(settings, player=restarted_player, client=mock_services(sse_audio))
     async with restarted.run_test() as pilot:
-        await restarted.prepare_worker.wait()
-        await pilot.pause()
+        await streamed(restarted, pilot)
         assert restarted.query_one("#url", Input).value == "https://example.com/story"
         assert restarted_player.position == 37.25
         assert restarted_player.speed == 1.5
         assert restarted_player.paused == paused
         assert restarted.query_one(ArticleText).current == 1
-        assert restarted.restoring is None
 
 
 async def test_periodic_save_and_switching_articles_do_not_mix_positions(
@@ -106,7 +107,7 @@ async def test_periodic_save_and_switching_articles_do_not_mix_positions(
         settings, "https://one.test", player=FakePlayer(), client=mock_services(sse_audio)
     )
     async with app.run_test() as pilot:
-        await app.prepare_worker.wait()
+        await streamed(app, pilot)
         narration = app.narration_id
         app.player.position = 13
         app.last_saved_at = 0
@@ -116,17 +117,19 @@ async def test_periodic_save_and_switching_articles_do_not_mix_positions(
             == 13
         )
         app.player.position = 17
+        await until(pilot, lambda: app.heard == 17)
         app.query_one("#url", Input).value = "https://two.test"
         app.begin_load()
         await app.prepare_worker.wait()
-        await pilot.pause()
+        await streamed(app, pilot)
         assert app.position == 0
         assert app.playback_state.get("https://one.test", narration).position == 17
         app.player.position = 22
+        await until(pilot, lambda: app.heard == 22)
         app.query_one("#url", Input).value = "https://one.test"
         app.begin_load()
         await app.prepare_worker.wait()
-        await pilot.pause()
+        await streamed(app, pilot)
         assert app.player.position == 17
         assert app.playback_state.get("https://two.test", narration).position == 22
 
@@ -167,20 +170,18 @@ async def test_restore_waits_silently_for_target_without_overwriting_bookmark(
     app = ReaderApp(settings, player=FakePlayer(), client=client)
     async with app.run_test() as pilot:
         await asyncio.wait_for(waiting.wait(), 2)
-        await pilot.pause()
-        assert app.ready and app.restoring
-        assert app.player.paused
+        await until(pilot, lambda: app.ready)
+        assert app.seek.restore and app.seek.stage is Stage.BUFFERING
+        assert app.player.paused  # Silent until speech reaches the saved position.
         assert app.player.position == 0
-        await app.checkpoint(force=True, query_player=True)
+        app.checkpoint(force=True)
         assert PlaybackState(tmp_path / "playback.json").get(url, narration) == original
         gate.set()
-        await app.prepare_worker.wait()
-        await pilot.pause()
+        await until(pilot, lambda: app.seek is None)
         # The playlist starts at the restored paragraph; earlier ones are not generated.
         assert requests == ["Second."]
         assert app.player.position == 1.25
         assert not app.player.paused
-        assert app.restoring is None
 
 
 async def test_quitting_during_restore_keeps_saved_target(tmp_path, tts_endpoint):
@@ -200,7 +201,7 @@ async def test_quitting_during_restore_keeps_saved_target(tmp_path, tts_endpoint
     )
     async with app.run_test() as pilot:
         await started.wait()
-        await app.action_quit()
+        app.action_quit()
         await pilot.pause()
     assert PlaybackState(tmp_path / "playback.json").get(original.url, "audio") == original
 
@@ -210,19 +211,20 @@ async def test_finished_narration_stays_finished_and_can_replay(tmp_path, tts_en
     app = ReaderApp(
         settings, "https://example.test", player=FakePlayer(), client=mock_services(sse_audio)
     )
-    async with app.run_test():
-        await app.prepare_worker.wait()
-        app.player.ended = True
-        await app.action_quit()
+    async with app.run_test() as pilot:
+        await streamed(app, pilot)
+        app.player.position, app.player.ended = 60, True
+        await until(pilot, lambda: app.ended)
+        app.action_quit()
     restarted = ReaderApp(settings, player=FakePlayer(), client=mock_services(sse_audio))
     async with restarted.run_test() as pilot:
-        await restarted.prepare_worker.wait()
-        await pilot.pause()
+        await streamed(restarted, pilot)
         assert restarted.ended and restarted.player.paused
         assert restarted.player.position == pytest.approx(restarted.duration, abs=0.02)
-        await restarted.action_toggle_pause()
+        restarted.action_toggle_pause()
+        await until(pilot, lambda: restarted.seek is None and not restarted.player.paused)
         assert restarted.player.position == 0
-        assert not restarted.player.paused and not restarted.ended
+        assert not restarted.ended
 
 
 async def test_restart_remembers_tui_voice_but_respects_explicit_config_changes(
@@ -235,10 +237,11 @@ async def test_restart_remembers_tui_voice_but_respects_explicit_config_changes(
     # Simulate a session choice before Read, retaining the original startup config.
     app.settings = replace(settings, voice="Emily_v3.1")
     app.synthesizer = Synthesizer(app.settings, app.client)
-    async with app.run_test():
-        await app.prepare_worker.wait()
+    async with app.run_test() as pilot:
+        await streamed(app, pilot)
         app.player.position = 5
-        await app.action_quit()
+        await until(pilot, lambda: app.heard == 5)
+        app.action_quit()
     for configured, restore_choices, expected in [
         (settings, True, "Emily_v3.1"),
         (settings, False, settings.voice_id),

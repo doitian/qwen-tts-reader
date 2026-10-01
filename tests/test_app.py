@@ -10,9 +10,12 @@ from qwen_reader.model_screen import ModelScreen
 
 
 class FakePlayer:
+    """Like MpvPlayer: a seek restores the pause state last set through the player."""
+
     def __init__(self):
         self.position = 0.0
         self.paused = False
+        self.user_paused = False
         self.ended = False
         self.speed = 1.0
         self.closed = False
@@ -29,7 +32,7 @@ class FakePlayer:
     async def load(self, path, speed, *, paused=False):
         self.loaded.append(path)
         self.speed = speed
-        self.paused = paused
+        self.paused = self.user_paused = paused
         self.ended = False
 
     async def status(self):
@@ -40,11 +43,12 @@ class FakePlayer:
         self.ended = False
 
     async def set_paused(self, paused):
-        self.paused = paused
+        self.paused = self.user_paused = paused
 
     async def seek(self, position):
         self.seeks.append(position)
         self.position = position
+        self.paused = self.user_paused
         self.ended = False
 
     async def set_speed(self, speed):
@@ -52,6 +56,23 @@ class FakePlayer:
 
     async def close(self):
         self.closed = True
+
+
+async def until(pilot, condition, seconds=5.0):
+    for _ in range(int(seconds / 0.02)):
+        if condition():
+            return
+        await pilot.pause(0.02)
+    raise AssertionError("condition not reached")
+
+
+async def streamed(app, pilot, seconds=5.0):
+    """Wait until all of the article's audio is in the player and no seek is pending."""
+    await until(
+        pilot,
+        lambda: app.generation_complete and not app.window.parts and app.seek is None,
+        seconds,
+    )
 
 
 def mock_services(sse_audio):
@@ -80,8 +101,7 @@ async def test_article_to_playback_keyboard_buttons_and_replay(
     async with app.run_test(size=size) as pilot:
         app.query_one("#url", Input).value = "https://example.com/story"
         await pilot.press("enter")
-        await app.prepare_worker.wait()
-        await pilot.pause()
+        await streamed(app, pilot)
         assert app.ready
         assert "Test article" in str(app.query_one("#article-title", Static).render())
         assert len(player.loaded) == 1
@@ -90,34 +110,36 @@ async def test_article_to_playback_keyboard_buttons_and_replay(
         assert app.query_one("#hint").region.bottom <= size[1] - 1
         assert app.query_one("#article-view").content_region.height >= 4
         await pilot.press("space")
-        assert player.paused
+        await until(pilot, lambda: player.paused)
         await pilot.press("right")
-        assert app.position == 10  # Shown at once; mpv seeks after the debounce.
-        assert player.seeks == []
-        await pilot.pause(0.3)
-        assert player.seeks == [10]
+        assert app.position == 10  # The UI shows the target at once.
+        assert player.seeks == []  # mpv seeks after the debounce.
+        await until(pilot, lambda: player.seeks == [10] and app.seek is None)
         assert player.paused
         await pilot.press("left", "left")
-        await pilot.pause(0.3)
+        await until(pilot, lambda: app.seek is None)
         assert player.seeks == [10, 0]  # Rapid presses collapse into one seek.
         await pilot.press("plus", "equals")
-        assert player.speed == 1.2
+        await until(pilot, lambda: player.speed == 1.2)
         await pilot.click("#slower")
-        assert player.speed == 1.1
+        await until(pilot, lambda: player.speed == 1.1)
         await pilot.click("#play")
-        assert not player.paused
+        await until(pilot, lambda: not player.paused)
         await pilot.press("ctrl+l")
         assert isinstance(app.focused, Input)
         await pilot.press("left", "minus")
+        await pilot.pause(0.4)
         assert player.speed == 1.1
-        assert player.position == 0
+        assert player.seeks == [10, 0]
         await pilot.press("escape")
-        player.ended = True
-        player.paused = True
+        # mpv pauses itself at the end of the article.
+        player.position, player.ended, player.paused = 30, True, True
         await app.refresh_playback()
+        assert app.ended
+        assert str(app.query_one("#play", Button).label) == "Replay"
         await pilot.press("space")
+        await until(pilot, lambda: app.seek is None and not player.paused)
         assert not player.ended
-        assert not player.paused
         assert player.position == 0
     assert player.closed
     assert app.client.is_closed

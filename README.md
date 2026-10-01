@@ -55,7 +55,7 @@ The article is rendered from Defuddle's Markdown in a glow-like style: headings,
 
 The current **paragraph** is highlighted and kept in view. Paragraphs are the timing and seek units to avoid many tiny sentence requests; exceptionally long paragraphs are split near sentence boundaries. Highlighting follows mpv's audio position, so pause, speed changes, rewind, and replay stay aligned. Scrolling turns off automatic following while the highlight continues to show what is playing. It stays off until you click **Resume sync**, including when you click text to seek. Loading a new article starts with following enabled.
 
-Clicking the paragraph that is streaming, or the next one, marks it in yellow and queues a seek; playback jumps there as soon as its first audio arrives. Clicking any other unbuffered paragraph restarts playback there. The status shows that it is waiting. Another text click replaces the pending selection; play/pause or a timed seek clears it. Clicking text preserves the current pause state.
+While seeking, the screen is the source of truth: the timeline and highlight show the target at once, and they follow speech again only once the player reports that position, so they never jump back to where speech was. If the target has no audio yet, speech goes silent and the paragraph is marked in yellow until its audio arrives; the status shows that it is waiting. A paragraph that is streaming, or the next one, is waited for; any other paragraph restarts playback there. Another seek replaces a pending one, and play/pause while waiting decides whether speech plays once it arrives. Seeking preserves the current pause state.
 
 ## Models
 

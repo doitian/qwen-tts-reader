@@ -1,8 +1,10 @@
+import asyncio
 import json
+import time
 
 import httpx
 import pytest
-from test_app import FakePlayer
+from test_app import FakePlayer, until
 from textual.widgets import Static
 
 from qwen_reader.app import ReaderApp
@@ -12,14 +14,6 @@ from qwen_reader.player import MpvPlayer, find_mpv
 
 PARAGRAPHS = [f"Paragraph {i}." for i in range(10)]
 BODY = "---\ntitle: Opening\n---\n" + "\n\n".join(PARAGRAPHS)
-
-
-async def until(pilot, condition, seconds=5.0):
-    for _ in range(int(seconds / 0.05)):
-        if condition():
-            return
-        await pilot.pause(0.05)
-    raise AssertionError("condition not reached")
 
 
 def reader(tmp_path, tts_endpoint, sse_audio, requests, player):
@@ -37,6 +31,10 @@ def reader(tmp_path, tts_endpoint, sse_audio, requests, player):
     )
 
 
+async def landed(pilot, app, anchor, seconds=5.0):
+    await until(pilot, lambda: app.timeline.anchor == anchor and app.seek is None, seconds)
+
+
 async def test_buffers_three_minutes_ahead_and_follows_playback(tmp_path, tts_endpoint, sse_audio):
     requests, player = [], FakePlayer()
     app = reader(tmp_path, tts_endpoint, sse_audio, requests, player)
@@ -52,13 +50,12 @@ async def test_buffers_three_minutes_ahead_and_follows_playback(tmp_path, tts_en
         assert "04:00 buffered ahead" in timeline
 
         player.position = 100
-        await app.refresh_playback()
         await until(pilot, lambda: len(requests) == 5)
         assert requests[-1] == "Paragraph 3."
 
         # A double speed listener needs twice the audio for the same three minutes.
-        await app.action_speed(1)
-        assert app.has_room()
+        app.action_speed(1)
+        assert app.has_room(app.window)
 
 
 async def test_seeking_far_ahead_restarts_there_and_reuses_cached_paragraphs(
@@ -68,22 +65,22 @@ async def test_seeking_far_ahead_restarts_there_and_reuses_cached_paragraphs(
     app = reader(tmp_path, tts_endpoint, sse_audio, requests, player)
     async with app.run_test() as pilot:
         await until(pilot, lambda: len(requests) == 4 and app.duration >= 240)
-        await app.seek_paragraph(8)
-        await until(pilot, lambda: app.ready and app.timeline.anchor == 8)
+        app.request_seek(8)
+        assert app.query_one("#article-text").current == 8  # The UI shows the target at once.
+        await landed(pilot, app, 8)
         # Skipped paragraphs are never generated; the target streams immediately.
         assert requests[4] == "Paragraph 7."
         assert "Paragraph 3." not in requests
         assert app.query_one("#article-text").current == 8
-        start = app.timeline.start(8)
-        assert app.position == start
-        await app.checkpoint(force=True)
+        assert app.position == app.timeline.start(8)
+        app.checkpoint(force=True)
         bookmark = PlaybackState(tmp_path / "playback.json").get(app.current_url, app.narration_id)
         assert (bookmark.unit, bookmark.unit_offset) == (8, 0)
 
         # Cached paragraphs come back without new requests and stay in the playlist.
         before = len(requests)
-        await app.seek_paragraph(2)
-        await until(pilot, lambda: app.ready and app.timeline.anchor == 0)
+        app.request_seek(2)
+        await landed(pilot, app, 0)
         assert app.query_one("#article-text").current == 2
         assert app.position == 120
         assert player.position == 120
@@ -99,18 +96,73 @@ async def test_rewinding_past_the_playlist_start_restarts_one_paragraph_earlier(
     app = reader(tmp_path, tts_endpoint, sse_audio, requests, player)
     async with app.run_test() as pilot:
         await until(pilot, lambda: len(requests) == 4)
-        await app.seek_paragraph(8)
-        await until(pilot, lambda: app.ready and app.timeline.anchor == 8)
+        app.request_seek(8)
+        await landed(pilot, app, 8)
         target = app.position - 10
-        await app.action_seek(-10)
-        await until(pilot, lambda: app.ready and app.timeline.anchor == 7)
+        app.action_seek(-10)
+        assert app.position == target  # The UI is the source of truth while seeking.
+        await landed(pilot, app, 7)
         assert "Paragraph 6." in requests
         assert "Paragraph 5." not in requests
-        await until(pilot, lambda: app.pending_selection is None and 7 in app.timeline.known)
-        await app.refresh_playback()
-        # Times stay continuous across the restart: 10s before where the old playlist began.
-        assert app.position == target
+        # Paragraph 7 is placed where the UI showed it, so speech lands at the target,
+        # unless its real length is shorter than estimated and the target is past its end.
         assert app.query_one("#article-text").current == 7
+        assert target - 5 < app.position <= target + 0.01
+
+
+async def test_back_to_back_restarts_keep_playing_once_the_target_arrives(
+    tmp_path, tts_endpoint, sse_audio
+):
+    requests, player = [], FakePlayer()
+    app = reader(tmp_path, tts_endpoint, sse_audio, requests, player)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: len(requests) == 4 and app.seek is None)
+        assert not player.paused
+        app.request_seek(8)
+        await until(pilot, lambda: app.window.anchor == 8)
+        # Replaced while the first restart may still be silent, waiting for its target.
+        app.request_seek(10)
+        await landed(pilot, app, 10)
+        assert not player.paused and not app.paused
+
+        # While paused, a restart stays paused; play/pause during the wait changes that.
+        app.action_toggle_pause()
+        await until(pilot, lambda: player.paused)
+        app.request_seek(5)
+        app.action_toggle_pause()
+        await landed(pilot, app, 5)
+        assert app.query_one("#article-text").current == 5
+        assert not player.paused
+
+
+async def test_keys_and_quit_never_wait_for_a_stuck_player(tmp_path, tts_endpoint, sse_audio):
+    class StuckPlayer(FakePlayer):
+        """Every seek hangs, as if mpv stopped answering."""
+
+        def __init__(self):
+            super().__init__()
+            self.stuck = asyncio.Event()
+
+        async def seek(self, position):
+            self.stuck.set()
+            await asyncio.Event().wait()
+
+    requests, player = [], StuckPlayer()
+    app = reader(tmp_path, tts_endpoint, sse_audio, requests, player)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: len(requests) == 4 and app.seek is None)
+        app.query_one("#article-view").focus()
+        await pilot.press("j", "j")
+        await asyncio.wait_for(player.stuck.wait(), 2)
+        # The controller is blocked inside mpv, yet keys still update the UI at once.
+        started = time.monotonic()
+        await pilot.press("j", "k", "j")
+        assert app.seek.unit == 3
+        assert app.query_one("#article-text").current == 3
+        await pilot.press("q")
+        await until(pilot, lambda: not app.is_running)
+        assert time.monotonic() - started < 3
+    assert player.closed
 
 
 @pytest.mark.skipif(not find_mpv(), reason="mpv is not installed")
@@ -121,46 +173,14 @@ async def test_real_mpv_restarts_reuse_cache_and_keep_time_continuous(
     app = reader(tmp_path, tts_endpoint, sse_audio, requests, MpvPlayer(audio_output="null"))
     async with app.run_test() as pilot:
         # Cached-paragraph bursts and file switches must not surface as player errors.
-        await until(pilot, lambda: app.ready and len(requests) == 5, 10)
-        await app.seek_paragraph(8)
-        await until(pilot, lambda: app.ready and app.timeline.anchor == 8, 10)
-        await until(pilot, lambda: app.pending_selection is None, 10)
-        await app.refresh_playback()
+        await until(pilot, lambda: app.ready and len(requests) >= 4 and app.seek is None, 10)
+        app.request_seek(8)
+        await landed(pilot, app, 8, 10)
         assert app.position == pytest.approx(app.timeline.start(8), abs=0.3)
-        await app.action_seek(-10)
-        await until(pilot, lambda: app.ready and app.timeline.anchor == 7, 10)
-        await until(pilot, lambda: app.pending_selection is None, 10)
-        await app.refresh_playback()
+        app.action_seek(-10)
+        await landed(pilot, app, 7, 10)
         assert app.timeline.start(7) < app.position < app.timeline.start(8)
-        await app.seek_paragraph(2)
-        await until(pilot, lambda: app.ready and app.timeline.anchor == 0, 10)
-        await until(pilot, lambda: app.pending_selection is None, 10)
-        await app.refresh_playback()
+        app.request_seek(2)
+        await landed(pilot, app, 0, 10)
         assert app.position == pytest.approx(120, abs=0.3)
-        assert "Paragraph 4." not in requests[:7]
         assert not app.generation_error
-
-
-async def test_back_to_back_restarts_keep_playing_once_the_target_arrives(
-    tmp_path, tts_endpoint, sse_audio
-):
-    requests, player = [], FakePlayer()
-    app = reader(tmp_path, tts_endpoint, sse_audio, requests, player)
-    async with app.run_test() as pilot:
-        await until(pilot, lambda: len(requests) == 4)
-        assert not player.paused
-        # The second restart starts while the first is still silent, waiting for its target.
-        await app.seek_paragraph(8)
-        await app.seek_paragraph(10)
-        await until(pilot, lambda: app.ready and app.timeline.anchor == 10)
-        await until(pilot, lambda: app.pending_selection is None)
-        assert not player.paused and not app.paused
-
-        # While paused, a restart stays paused; play/pause during the wait changes that.
-        await app.action_toggle_pause()
-        assert player.paused
-        await app.seek_paragraph(5)
-        await app.action_toggle_pause()
-        await until(pilot, lambda: app.ready and not app.restarting)
-        assert app.query_one("#article-text").current == 5
-        assert not player.paused

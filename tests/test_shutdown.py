@@ -1,6 +1,6 @@
 import httpx
 import pytest
-from test_app import FakePlayer, mock_services
+from test_app import FakePlayer, mock_services, streamed, until
 from textual import events
 from textual.command import CommandInput
 
@@ -44,8 +44,10 @@ async def test_quit_from_every_surface_saves_progress_and_closes_player(
         settings, "https://example.test", player=FakePlayer(), client=mock_services(sse_audio)
     )
     async with app.run_test() as pilot:
-        await app.prepare_worker.wait()
+        await streamed(app, pilot)
         app.player.position = 19.25
+        # Quitting saves what the controller last heard; it never waits on mpv.
+        await until(pilot, lambda: app.heard == 19.25)
         if surface == "model":
             await pilot.click("#choose-model")
         elif surface.startswith("palette"):

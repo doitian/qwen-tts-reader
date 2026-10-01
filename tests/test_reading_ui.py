@@ -3,16 +3,15 @@ import json
 
 import httpx
 import pytest
-from test_app import FakePlayer
+from test_app import FakePlayer, mock_services, streamed, until
 from test_streaming import STOP, ByteStream, pcm_event
 from textual import events
 from textual.scrollbar import ScrollTo
-from textual.widgets import Button, Input, Static
+from textual.widgets import Button, Input, Select, Static
 
-from qwen_reader.app import ReaderApp
+from qwen_reader.app import ReaderApp, Stage
 from qwen_reader.article_view import ArticleText, ArticleView
 from qwen_reader.config import Settings
-from qwen_reader.narration import Cue
 
 
 @pytest.mark.parametrize("size", [(80, 24), (120, 36)])
@@ -37,8 +36,7 @@ async def test_highlight_follow_browse_click_resume_resize_and_cached_replay(
         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
     async with app.run_test(size=size) as pilot:
-        await app.prepare_worker.wait()
-        await pilot.pause()
+        await streamed(app, pilot)
         text = app.query_one(ArticleText)
         view = app.query_one(ArticleView)
         assert len(text.spans) == 14
@@ -70,12 +68,12 @@ async def test_highlight_follow_browse_click_resume_resize_and_cached_replay(
         assert view.scroll_y == 0
 
         # Click the visible second paragraph while paused; it stays in browse mode.
-        player.paused = True
-        await app.refresh_playback()
+        await pilot.press("space")
+        await until(pilot, lambda: player.paused)
         target = text.reading_region(1)
         assert target is not None
         await pilot.click("#article-text", offset=(1, target.y))
-        await pilot.pause()
+        await until(pilot, lambda: app.seek is None)
         assert player.position == 2
         assert player.paused
         assert text.current == 1
@@ -97,17 +95,19 @@ async def test_highlight_follow_browse_click_resume_resize_and_cached_replay(
         assert view.following
 
         # Speed and pause use the source timeline; replay returns to the first unit.
-        await app.action_speed(1)
-        assert text.current == 12
-        player.ended = True
+        app.action_speed(1)
         await app.refresh_playback()
-        await app.action_toggle_pause()
+        assert text.current == 12
+        player.position, player.ended = 28, True
+        await app.refresh_playback()
+        app.action_toggle_pause()
+        await until(pilot, lambda: app.seek is None)
         assert text.current == 0
         assert not player.paused
         calls_before = len(calls)
         app.begin_load()
         await app.prepare_worker.wait()
-        await pilot.pause()
+        await streamed(app, pilot)
         assert len(calls) == calls_before
         player.position = 8.1
         await app.refresh_playback()
@@ -171,8 +171,7 @@ async def test_vim_keys_seek_paragraphs_and_time_scroll_and_follow(
         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
     async with app.run_test(size=(80, 24)) as pilot:
-        await app.prepare_worker.wait()
-        await pilot.pause()
+        await streamed(app, pilot)
         text = app.query_one(ArticleText)
         view = app.query_one(ArticleView)
 
@@ -188,23 +187,24 @@ async def test_vim_keys_seek_paragraphs_and_time_scroll_and_follow(
         await pilot.press("h")
         assert app.position == 4
         assert player.seeks == []
-        await pilot.pause(0.3)
+        await until(pilot, lambda: app.seek is None)
         assert player.seeks == [4]
         assert player.position == 4
         await pilot.press("k", "k", "k")
-        await pilot.pause(0.3)
+        await until(pilot, lambda: app.seek is None)
         assert player.seeks == [4, 0]
-        # Play/pause applies a queued seek first instead of waiting for the debounce.
+        # Play/pause during a queued seek only changes whether speech plays once it lands.
         await pilot.press("l", "space")
+        await until(pilot, lambda: app.seek is None and player.paused)
         assert player.seeks == [4, 0, 10]
         await pilot.press("space")
-        await pilot.pause(0.3)
+        await until(pilot, lambda: not player.paused)
         assert player.seeks == [4, 0, 10]
         last = app.duration - 1
         player.position = last
         await app.refresh_playback()
         await pilot.press("j")
-        await pilot.pause(0.3)
+        await pilot.pause(0.4)
         assert player.position == last  # Already in the last paragraph.
 
         await pilot.press("ctrl+b")
@@ -221,10 +221,10 @@ async def test_vim_keys_seek_paragraphs_and_time_scroll_and_follow(
         assert target is not None and target.height > 1
         view.set_following(False)
         view.scroll_to(y=target.y + 1, animate=False)
-        player.paused = True
-        await pilot.pause()
+        await pilot.press("space")
+        await until(pilot, lambda: player.paused)
         await pilot.press("r")
-        await pilot.pause()
+        await until(pilot, lambda: app.seek is None and not player.paused)
         assert player.position == 20
         assert not player.paused
         assert text.current == 10
@@ -270,44 +270,54 @@ async def test_click_unbuffered_paragraph_waits_then_seeks_without_resuming_foll
     )
     async with app.run_test() as pilot:
         await asyncio.wait_for(started.wait(), 2)
-        await pilot.pause()
-        assert app.preparing and app.ready
+        await until(pilot, lambda: app.ready and app.seek is None)
+        assert app.preparing
         text = app.query_one(ArticleText)
         view = app.query_one(ArticleView)
         view.set_following(False)
-        player.paused = True
-        await app.refresh_playback()
+        await pilot.press("space")
+        await until(pilot, lambda: player.paused)
         await pilot.click("#article-text", offset=(0, text.reading_region(1).y))
-        await pilot.pause()
-        assert app.pending_selection == 1
+        await until(pilot, lambda: app.seek and app.seek.stage is Stage.BUFFERING)
+        assert app.seek.unit == 1
         assert "Waiting for paragraph 2" in str(app.query_one("#status", Static).render())
+        assert text.pending == 1  # The UI shows the target while speech catches up.
         assert player.position == 0
         gate.set()
-        await app.prepare_worker.wait()
-        await pilot.pause()
-        assert app.pending_selection is None
+        await until(pilot, lambda: app.seek is None)
         assert player.position == 1
         assert player.paused
         assert text.current == 1
         assert not view.following
-        await app.action_seek(-10)
+        app.action_seek(-10)
         assert text.current == 0
 
 
-async def test_text_cannot_seek_to_stale_audio_after_model_change(tmp_path):
-    app = ReaderApp(Settings(cache_dir=tmp_path), player=FakePlayer(), client=httpx.AsyncClient())
-    async with app.run_test() as pilot:
-        text = app.query_one(ArticleText)
-        text.set_article("First.\n\nSecond.", 1800)
-        app.cues = {0: Cue(0, 6, 0, 1), 8: Cue(8, 15, 1, 2)}
-        app.duration = 2
-        app.set_ready(True)
-        app.reset_reading()
-        app.set_ready(False)
-        await app.select_text(ArticleText.Selected(1))
+async def test_text_cannot_seek_to_stale_audio_after_model_change(
+    tmp_path, tts_endpoint, sse_audio
+):
+    player = FakePlayer()
+    app = ReaderApp(
+        Settings(api_key="key", endpoint=tts_endpoint, cache_dir=tmp_path),
+        "https://example.test",
+        player=player,
+        client=mock_services(sse_audio),
+    )
+    async with app.run_test(size=(80, 24)) as pilot:
+        await streamed(app, pilot)
+        await pilot.click("#choose-model")
         await pilot.pause()
+        app.screen.query_one("#model-choice", Select).value = "qwen-audio-3.0-tts-plus"
+        await pilot.pause()
+        await pilot.click("#model-apply")
+        await until(pilot, lambda: app.halted and app.window is None)
+        text = app.query_one(ArticleText)
+        app.select_text(ArticleText.Selected(1))
+        await pilot.pause(0.3)
+        # The old voice's audio is gone, and nothing plays until Read.
+        assert app.seek is None and app.window is None
         assert text.current is None
-        assert app.player.position == 0
+        assert player.seeks == []
 
 
 async def test_paragraph_keys_reveal_their_target_without_resuming_follow(
@@ -380,22 +390,21 @@ async def test_highlight_holds_the_seek_target_while_mpv_still_reports_the_old_p
         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
     async with app.run_test() as pilot:
-        await app.prepare_worker.wait()
-        await pilot.pause()
+        await streamed(app, pilot)
         text = app.query_one(ArticleText)
         player.position = 12.5
         await app.refresh_playback()
         assert text.current == 6
         await pilot.press("k", "k")
-        await pilot.pause(0.3)
-        assert player.seeks == [8]
+        await until(pilot, lambda: player.seeks == [8])
         for _ in range(3):
             await app.refresh_playback()
             assert text.current == 4  # Not back to paragraph 6.
+            assert app.seek is not None  # Speech hasn't caught up yet.
         player.catch_up()
         await app.refresh_playback()
         assert text.current == 4
-        assert app.held_position is None
+        assert app.seek is None
 
 
 async def test_reading_keys_do_nothing_before_an_article_loads(tmp_path):

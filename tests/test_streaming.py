@@ -5,7 +5,7 @@ import json
 
 import httpx
 import pytest
-from test_app import FakePlayer
+from test_app import FakePlayer, until
 from textual.widgets import Static
 
 from qwen_reader.app import ReaderApp
@@ -156,15 +156,16 @@ async def test_ui_plays_while_streaming_preserves_pause_and_reports_stream_failu
     )
     async with app.run_test() as pilot:
         await asyncio.wait_for(waiting.wait(), 2)
-        assert app.ready and app.preparing
+        await until(pilot, lambda: app.ready and app.seek is None)
+        assert app.preparing
         assert app.duration == 0.75
         player.ended = True  # Playback reached the live edge.
         await app.refresh_playback()
         assert "Buffering" in str(app.query_one("#status", Static).render())
         await pilot.press("space")
-        assert player.paused
+        await until(pilot, lambda: player.paused)  # Remembered for when audio resumes.
         gate.set()
-        await app.prepare_worker.wait()
+        await until(pilot, lambda: not app.preparing)
         await app.refresh_playback()
         assert player.paused
         assert not app.preparing

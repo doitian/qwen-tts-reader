@@ -163,4 +163,9 @@ class ArticleView(VerticalScroll):
             )
 
     def on_resize(self) -> None:
-        self.call_after_refresh(self.follow, self.query_one(ArticleText).current)
+        # Read the unit when the callback runs; by then it may have moved on.
+        self.call_after_refresh(self.follow_highlight)
+
+    def follow_highlight(self) -> None:
+        text = self.query_one(ArticleText)
+        self.follow(text.current if text.current is not None else text.pending)

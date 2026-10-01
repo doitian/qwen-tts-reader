@@ -1,6 +1,6 @@
 import httpx
 import pytest
-from test_app import FakePlayer
+from test_app import FakePlayer, until
 from textual.widgets import Input, Select
 
 from qwen_reader.app import ReaderApp
@@ -26,8 +26,7 @@ async def test_voice_dropdown_is_filtered_and_applies_selection(tmp_path, model)
         await pilot.press("down", "enter")
         assert voice.value == VOICES[model][0][1]
         await pilot.click("#model-apply")
-        await pilot.pause()
-        assert app.settings.voice == VOICES[model][0][1]
+        await until(pilot, lambda: app.settings.voice == VOICES[model][0][1])
         await pilot.click("#choose-model")
         await pilot.pause()
         assert app.screen.query_one("#voice-choice", Select).value == app.settings.voice
@@ -63,6 +62,5 @@ async def test_custom_voice_validation_and_model_switch_reset(tmp_path):
         await pilot.pause()
         custom.value = "  my-plus-clone  "
         await pilot.click("#model-apply")
-        await pilot.pause()
-        assert app.settings.voice == "my-plus-clone"
+        await until(pilot, lambda: app.settings.voice == "my-plus-clone")
         assert app.settings.model == "qwen-audio-3.0-tts-plus"
