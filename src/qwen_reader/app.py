@@ -15,6 +15,7 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.timer import Timer
 from textual.widgets import Button, Footer, Header, Input, ProgressBar, Static
 from textual.worker import Worker, WorkerCancelled, WorkerFailed
 
@@ -29,6 +30,8 @@ from .screens import ReaderCommandPalette
 from .synthesis import Synthesizer
 
 log = logging.getLogger(__name__)
+
+SEEK_DEBOUNCE = 0.25
 
 
 def timestamp(seconds: float) -> str:
@@ -139,6 +142,8 @@ class ReaderApp(App):
         self.save_warning_shown = False
         self.closing = False
         self.buffering_since: float | None = None
+        self.seek_target: float | None = None
+        self.seek_timer: Timer | None = None
         self.playing_sample: tuple[float, float] | None = None
 
     def compose(self) -> ComposeResult:
@@ -375,6 +380,8 @@ class ReaderApp(App):
         if not self.ready or not self.is_running or self.closing:
             return
         self.log_playback(position, paused, ended)
+        if self.seek_target is not None:
+            position, ended = self.seek_target, False
         self.position, self.paused = position, paused
         self.ended = self.restored_finished or (ended and not self.preparing)
         position = self.duration if self.ended else min(self.position, self.duration)
@@ -428,7 +435,7 @@ class ReaderApp(App):
             return
         if not force and time.monotonic() - self.last_saved_at < 2:
             return
-        if query_player:
+        if query_player and self.seek_target is None:
             with contextlib.suppress(PlayerError):
                 self.position, self.paused, ended = await self.player.status()
                 self.ended = self.restored_finished or (ended and not self.preparing)
@@ -473,6 +480,7 @@ class ReaderApp(App):
         await self.checkpoint(force=True)
 
     def reset_reading(self) -> None:
+        self.cancel_queued_seek()
         self.cues.clear()
         self.pending_selection = None
         self.query_one(ArticleText).highlight(None)
@@ -535,7 +543,13 @@ class ReaderApp(App):
         index = max(0, min(len(text.spans) - 1, base + delta))
         if delta > 0 and index == base:
             return
-        await self.seek_paragraph(index)
+        cue = self.cues.get(text.spans[index].start)
+        if self.ready and cue is not None and cue.time < self.duration:
+            self.restoring = None
+            self.pending_selection = None
+            await self.queue_seek(cue.time)
+        else:
+            await self.seek_paragraph(index)
 
     async def action_read_visible(self) -> None:
         view = self.query_one(ArticleView)
@@ -567,6 +581,7 @@ class ReaderApp(App):
         text = self.query_one(ArticleText)
         if not 0 <= index < len(text.spans):
             return False
+        self.cancel_queued_seek()
         self.restoring = None
         self.pending_selection = index
         seeked = await self.apply_pending_seek()
@@ -602,6 +617,7 @@ class ReaderApp(App):
 
     @on(Button.Pressed, "#play")
     async def action_toggle_pause(self) -> None:
+        await self.flush_seek()
         if not self.ready:
             return
         try:
@@ -622,21 +638,59 @@ class ReaderApp(App):
     async def action_seek(self, offset: float) -> None:
         if not self.ready:
             return
-        try:
-            self.restoring = None
-            self.pending_selection = None
-            position, paused, ended = await self.player.status()
+        self.restoring = None
+        self.pending_selection = None
+        # Repeated presses build on the queued target, not mpv's not-yet-seeked position.
+        if self.seek_target is not None:
+            position = self.seek_target
+        else:
+            try:
+                position, _, ended = await self.player.status()
+            except PlayerError as exc:
+                self.set_ready(False)
+                self.set_status(str(exc), error=True)
+                return
             if ended or self.restored_finished:
                 position = self.duration
-            self.restored_finished = False
-            target = max(0.0, min(self.duration - 0.01, position + offset))
+        await self.queue_seek(max(0.0, min(self.duration - 0.01, position + offset)))
+
+    async def queue_seek(self, target: float) -> None:
+        """Show the target at once, but seek mpv only after SEEK_DEBOUNCE without more seeks."""
+        self.restored_finished = False
+        self.seek_target = target
+        if self.seek_timer:
+            self.seek_timer.stop()
+        self.seek_timer = self.set_timer(SEEK_DEBOUNCE, self.flush_seek)
+        await self.refresh_playback()
+
+    def cancel_queued_seek(self) -> None:
+        if self.seek_timer:
+            self.seek_timer.stop()
+            self.seek_timer = None
+        self.seek_target = None
+
+    async def flush_seek(self) -> None:
+        if self.seek_timer:
+            self.seek_timer.stop()
+            self.seek_timer = None
+        target = self.seek_target
+        if target is None:
+            return
+        if not self.ready:
+            self.seek_target = None
+            return
+        try:
             await self.player.seek(target)
-            await self.player.set_paused(paused)
-            await self.refresh_playback()
-            await self.checkpoint(force=True)
         except PlayerError as exc:
+            self.seek_target = None
             self.set_ready(False)
             self.set_status(str(exc), error=True)
+            return
+        # A newer target queued during the seek keeps its own timer.
+        if self.seek_target == target:
+            self.seek_target = None
+        await self.refresh_playback()
+        await self.checkpoint(force=True)
 
     async def action_speed(self, delta: float) -> None:
         speed = round(max(0.5, min(3.0, self.speed + delta)), 1)

@@ -176,21 +176,35 @@ async def test_vim_keys_seek_paragraphs_and_time_scroll_and_follow(
         text = app.query_one(ArticleText)
         view = app.query_one(ArticleView)
 
+        # Within the debounce, each press builds on the previous target.
         await pilot.press("j", "j", "j")
-        assert player.position == 6
+        assert app.position == 6
         assert text.current == 3
         await pilot.press("k")
-        assert player.position == 4
+        assert app.position == 4
         await pilot.press("l")
-        assert player.position == 14
+        assert app.position == 14
+        assert text.current == 7
         await pilot.press("h")
+        assert app.position == 4
+        assert player.seeks == []
+        await pilot.pause(0.3)
+        assert player.seeks == [4]
         assert player.position == 4
         await pilot.press("k", "k", "k")
-        assert player.position == 0
+        await pilot.pause(0.3)
+        assert player.seeks == [4, 0]
+        # Play/pause applies a queued seek first instead of waiting for the debounce.
+        await pilot.press("l", "space")
+        assert player.seeks == [4, 0, 10]
+        await pilot.press("space")
+        await pilot.pause(0.3)
+        assert player.seeks == [4, 0, 10]
         last = app.duration - 1
         player.position = last
         await app.refresh_playback()
         await pilot.press("j")
+        await pilot.pause(0.3)
         assert player.position == last  # Already in the last paragraph.
 
         await pilot.press("ctrl+b")

@@ -18,6 +18,7 @@ class FakePlayer:
         self.closed = False
         self.loaded = []
         self.appended = []
+        self.seeks = []
 
     async def start(self):
         pass
@@ -42,6 +43,7 @@ class FakePlayer:
         self.paused = paused
 
     async def seek(self, position):
+        self.seeks.append(position)
         self.position = position
         self.ended = False
 
@@ -90,10 +92,14 @@ async def test_article_to_playback_keyboard_buttons_and_replay(
         await pilot.press("space")
         assert player.paused
         await pilot.press("right")
-        assert player.position == 10
+        assert app.position == 10  # Shown at once; mpv seeks after the debounce.
+        assert player.seeks == []
+        await pilot.pause(0.3)
+        assert player.seeks == [10]
         assert player.paused
         await pilot.press("left", "left")
-        assert player.position == 0
+        await pilot.pause(0.3)
+        assert player.seeks == [10, 0]  # Rapid presses collapse into one seek.
         await pilot.press("plus", "equals")
         assert player.speed == 1.2
         await pilot.click("#slower")

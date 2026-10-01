@@ -48,7 +48,7 @@ Bookmarks live in `playback.json` inside `QWEN_READER_CACHE_DIR`. They contain a
 | Esc | Cancel preparation / leave URL input |
 | Q / Ctrl+C | Quit |
 
-Playback shortcuts are inactive while editing the URL. Mouse buttons work too. Speed changes take effect immediately with pitch correction; they do not make another TTS request. Seeking preserves the paused state and works across received audio, including segment boundaries. Fast-forward clamps to the buffered end; playback waits there if more audio is still being generated. Once complete, the entire article is seekable.
+Playback shortcuts are inactive while editing the URL. Timed and paragraph seeks (arrows, H/L, J/K, ±10s buttons) are debounced by 250 ms: the timeline and highlight move at once, and repeated presses become one seek. Mouse buttons work too. Speed changes take effect immediately with pitch correction; they do not make another TTS request. Seeking preserves the paused state and works across received audio, including segment boundaries. Fast-forward clamps to the buffered end; playback waits there if more audio is still being generated. Once complete, the entire article is seekable.
 
 The current **paragraph** is highlighted and kept in view. Paragraphs are the timing and seek units to avoid many tiny sentence requests; exceptionally long paragraphs are split near sentence boundaries. Highlighting follows mpv's audio position, so pause, speed changes, rewind, and replay stay aligned. Scrolling turns off automatic following while the highlight continues to show what is playing. It stays off until you click **Resume sync**, including when you click text to seek. Loading a new article starts with following enabled.
 
