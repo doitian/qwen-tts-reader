@@ -14,6 +14,11 @@ MODEL_VOICES = {
 }
 
 
+def default_save_dir() -> Path:
+    downloads = Path.home() / "Downloads"
+    return downloads if downloads.is_dir() else Path.cwd()
+
+
 @dataclass(frozen=True)
 class Settings:
     api_key: str = field(default="", repr=False)
@@ -22,6 +27,7 @@ class Settings:
     voice: str = ""
     cache_dir: Path = Path.home() / ".cache" / "qwen-tts-reader"
     defuddle_key: str = field(default="", repr=False)
+    save_dir: Path = field(default_factory=lambda: default_save_dir())
     chunk_chars: int = 1800
 
     @classmethod
@@ -36,6 +42,7 @@ class Settings:
                 or Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache")) / "qwen-tts-reader"
             ).expanduser(),
             defuddle_key=os.getenv("DEFUDDLE_API_KEY", "").strip(),
+            save_dir=Path(os.getenv("QWEN_READER_SAVE_DIR") or default_save_dir()).expanduser(),
         )
 
     def validate_tts(self) -> None:

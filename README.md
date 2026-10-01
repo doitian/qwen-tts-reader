@@ -45,6 +45,7 @@ Bookmarks live in `playback.json` inside `QWEN_READER_CACHE_DIR`. They contain a
 | Scroll wheel / ↑ ↓ / Page Up, Page Down / Ctrl+F, Ctrl+B / Home, End / scrollbar | Browse freely; stop automatic following |
 | F / Resume sync button | Bring the current paragraph into view and resume following |
 | Ctrl+L | Focus the URL input |
+| Ctrl+S | Generate the whole article in the background and save it as a WAV file |
 | Model button / F2 | Choose a model and voice from dropdowns, or enter a custom voice ID |
 | Esc | Cancel preparation / leave URL input |
 | Q / Ctrl+C | Quit |
@@ -85,7 +86,10 @@ Applying a different model or voice stops playback; press Read to use the select
 | `QWEN_TTS_VOICE` | Optional override; leave blank for the selected model's default |
 | `DEFUDDLE_API_KEY` | Optional key for additional Defuddle requests |
 | `QWEN_READER_CACHE_DIR` | `$XDG_CACHE_HOME/qwen-tts-reader`, otherwise `~/.cache/qwen-tts-reader` |
+| `QWEN_READER_SAVE_DIR` | Where Ctrl+S saves narrations: `~/Downloads` if it exists, otherwise the current directory |
 | `QWEN_READER_LOG` | Optional playback timing log path; same as `--log` |
+
+Ctrl+S generates every paragraph that is not cached yet, without the three-minute limit and without interrupting playback, then saves the whole narration as a 24 kHz mono WAV named after the article. It never overwrites a file, and paragraphs playback also needs are requested only once. Progress shows in the status line.
 
 To debug choppy playback, run `uv run qwen-reader --log reader.log URL`. `reader.log` records TTS speed per paragraph, audio buffered ahead of playback, waits for audio, and stalls; mpv's own log goes to `reader.mpv.log`. Logs contain file names and timings, not API keys or article text.
 

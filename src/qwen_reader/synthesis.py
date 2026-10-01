@@ -138,6 +138,8 @@ class Synthesizer:
     def __init__(self, settings: Settings, client: httpx.AsyncClient):
         self.settings = settings
         self.client = client
+        # Shared by every stream, so playback and saving never request a paragraph twice.
+        self.locks: dict[Path, asyncio.Lock] = {}
 
     def cache_path(self, text: str, kind: str) -> Path:
         identity = json.dumps(
@@ -265,13 +267,12 @@ class Synthesizer:
 
         queues: dict[int, asyncio.Queue] = {}
         tasks: dict[int, asyncio.Task] = {}
-        locks: dict[Path, asyncio.Lock] = {}
 
         async def produce(index: int, queue: asyncio.Queue) -> None:
             span = spans[index]
             content = text[span.start : span.end]
             stream = self.stream_paragraph(content, spool_dir, index)
-            lock = locks.setdefault(self.cache_path(content, "chunk"), asyncio.Lock())
+            lock = self.locks.setdefault(self.cache_path(content, "chunk"), asyncio.Lock())
             try:
                 async with lock, contextlib.aclosing(stream):
                     async for part in stream:

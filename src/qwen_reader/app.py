@@ -5,6 +5,8 @@ import contextlib
 import hashlib
 import json
 import logging
+import re
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field, replace
@@ -38,6 +40,23 @@ SEEK_DEBOUNCE = 0.25
 LOOKAHEAD = 180
 # Speech has caught up with a seek once mpv reports a position this close to it.
 LANDED = 0.35
+
+
+def save_copy(source: Path, directory: Path, title: str) -> Path:
+    """Copy finished narration into `directory`, named after the article, never overwriting."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", title)
+    name = re.sub(r"\s+", " ", name).strip(" .")[:100] or "article"
+    # Windows reserves these device names, with or without an extension.
+    if re.fullmatch(r"(?i)(con|prn|aux|nul|com\d|lpt\d)", name):
+        name += " audio"
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / f"{name}.wav"
+    number = 2
+    while destination.exists():
+        destination = directory / f"{name} ({number}).wav"
+        number += 1
+    shutil.copyfile(source, destination)
+    return destination
 
 
 def timestamp(seconds: float) -> str:
@@ -133,6 +152,7 @@ class ReaderApp(App):
         Binding("ctrl+b", "scroll_page(-1)", "Page up", show=False),
         Binding("ctrl+l", "focus_url", "URL", priority=True),
         Binding("f2", "choose_model", "Model", priority=True),
+        Binding("ctrl+s", "save_audio", "Save audio"),
         Binding("escape", "cancel", "Cancel", priority=True),
         Binding("q", "quit", "Quit"),
         Binding("ctrl+c", "quit", "Quit", priority=True, show=False),
@@ -178,6 +198,8 @@ class ReaderApp(App):
         self.synthesizer = Synthesizer(settings, self.client)
         self.prepare_worker: Worker | None = None
         self.controller: Worker | None = None
+        self.save_worker: Worker | None = None
+        self.save_message = ""
         self.wakeup = asyncio.Event()
         self.mpv_lock = asyncio.Lock()
         self.closing = False
@@ -187,6 +209,7 @@ class ReaderApp(App):
         self.halted = False
         self.current_url = ""
         self.narration_id = ""
+        self.article_title = ""
         self.article_text = ""
         self.spans: list[TextSpan] = []
         self.unit_of: dict[int, int] = {}
@@ -410,6 +433,7 @@ class ReaderApp(App):
                 animate=False, immediate=True
             )
             self.current_url = url
+            self.article_title = article.title
             self.article_text = article.text
             self.spans = text.spans
             self.unit_of = {span.start: index for index, span in enumerate(self.spans)}
@@ -790,19 +814,19 @@ class ReaderApp(App):
         self.update_playback_status()
 
     def update_playback_status(self) -> None:
+        saving = f" · {self.save_message}" if self.save_message else ""
         seek = self.seek
         if self.generation_error:
-            self.set_status(f"Stopped · {self.generation_error}", error=True)
+            self.set_status(f"Stopped · {self.generation_error}{saving}", error=True)
             return
         if seek and seek.stage is Stage.BUFFERING:
             if seek.reason == "restore":
-                self.set_status(
-                    f"Restoring {timestamp(self.position)} · waiting for audio… · Esc to cancel"
-                )
+                message = f"Restoring {timestamp(self.position)} · waiting for audio…"
             elif seek.reason == "start":
-                self.set_status(f"{self.synthesis_message or 'Preparing'} · Esc to cancel")
+                message = self.synthesis_message or "Preparing"
             else:
-                self.set_status(f"Waiting for paragraph {seek.unit + 1} to buffer… · Esc to cancel")
+                message = f"Waiting for paragraph {seek.unit + 1} to buffer…"
+            self.set_status(f"{message} · Esc to cancel{saving}")
             return
         if self.ended:
             state = "Finished · Space to replay"
@@ -817,7 +841,7 @@ class ReaderApp(App):
             state = f"Paragraph {unit + 1}/{len(self.spans)} · {state}"
         if self.preparing and self.synthesis_message:
             state += f" · {self.synthesis_message} · Esc to cancel"
-        self.set_status(state)
+        self.set_status(state + saving)
 
     def update_reading(self) -> None:
         text = self.query_one(ArticleText)
@@ -956,6 +980,40 @@ class ReaderApp(App):
     def faster(self) -> None:
         self.action_speed(0.1)
 
+    def action_save_audio(self) -> None:
+        if not self.article_loaded:
+            self.notify("Load an article first.", severity="warning")
+            return
+        if self.save_worker and self.save_worker.is_running:
+            self.notify("Already saving this article's audio.")
+            return
+        self.save_worker = self.save_audio(self.article_text, self.article_title)
+
+    @work(group="save")
+    async def save_audio(self, text: str, title: str) -> None:
+        """Generate every paragraph not cached yet, then save the whole narration."""
+        synthesizer = self.synthesizer
+        self.save_message = "Saving audio…"
+
+        def progress(done: int, total: int, message: str) -> None:
+            self.save_message = f"Saving audio · {done}/{total} paragraphs"
+
+        try:
+            narration = await synthesizer.synthesize(text, progress)
+            directory = synthesizer.settings.save_dir
+            saved = await asyncio.to_thread(save_copy, narration, directory, title)
+        except (httpx.HTTPError, ValueError, OSError, TimeoutError) as exc:
+            self.notify(
+                f"Could not save audio: {self.describe_failure(exc)}", severity="error", timeout=10
+            )
+        else:
+            log.info("saved narration to %s", saved)
+            self.notify(f"Saved {saved}", timeout=10)
+            if text == self.article_text:
+                self.timeline.known.update(synthesizer.known_durations(text))
+        finally:
+            self.save_message = ""
+
     def action_focus_url(self) -> None:
         self.query_one("#url", Input).focus()
 
@@ -1024,7 +1082,7 @@ class ReaderApp(App):
         self.closing = True
         self.wake()
         started = time.monotonic()
-        workers = [self.controller, self.prepare_worker]
+        workers = [self.controller, self.prepare_worker, self.save_worker]
         if self.window:
             workers.append(self.window.worker)
         for worker in filter(None, workers):
